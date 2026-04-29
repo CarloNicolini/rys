@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+.env
+
+# --- uv ---
+# Keep uv.lock committed; ignore uv build caches
+.uv/
+
+# --- Notebook ---
+.ipynb_checkpoints/
+
+# --- Experiment artefacts (large) ---
+data/
+results/activations_*.parquet
+results/figures/*.html
+results/checkpoints/
+results/lm_eval_outputs/
+results/cache/
+*.bin
+*.safetensors
+
+# --- HuggingFace cache (when set inside repo) ---
+.hf_cache/
+.cache/
+
+# --- OS / IDE ---
+.DS_Store
+.idea/
+.vscode/

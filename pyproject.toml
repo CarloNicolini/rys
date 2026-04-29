@@ -1,0 +1,75 @@
+[project]
+name = "rys"
+version = "0.1.0"
+description = "Empirical CKA connectome and Repeat-Your-Self (RYS) experiments on Llama-3.2-3B-Instruct."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Carlo Nicolini" },
+]
+requires-python = ">=3.12"
+
+dependencies = [
+    # Core deep-learning stack
+    "torch>=2.4",
+    "transformers>=4.45",
+    "accelerate>=1.0",
+    "datasets>=3.0",
+    "huggingface-hub>=0.25",
+    "safetensors>=0.4",
+    # CKA implementation (Kornblith 2019, minibatch HSIC1 from Nguyen 2020)
+    "ckatorch>=1.0",
+    # Standardised LLM eval pipeline (GSM8K, CSQA, MMLU)
+    "lm-eval>=0.4.5",
+    # Numerics & data
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+    "scipy>=1.14",
+    "scikit-learn>=1.5",
+    # Graph analytics on CKA connectomes
+    "networkx>=3.3",
+    "python-igraph>=0.11",
+    "leidenalg>=0.10",
+    "ruptures>=1.1",
+    # Visualisation
+    "plotly>=5.24",
+    "kaleido==0.2.1",
+    "matplotlib>=3.9",
+    # Notebook
+    "jupyterlab>=4.2",
+    "ipykernel>=6.29",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# 8-bit quantisation requires a CUDA toolkit; install on the GPU machine that runs the notebook.
+gpu = [
+    "bitsandbytes>=0.44",
+]
+
+[project.scripts]
+rys-eval = "rys.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
