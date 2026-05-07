@@ -55,6 +55,18 @@ rys-eval = "rys.cli:main"
 requires = ["uv_build>=0.9.17,<0.10.0"]
 build-backend = "uv_build"
 
+# Linux: CUDA wheels from PyTorch (macOS/Windows stay on PyPI). cu126 matches recent 12.x drivers
+# (e.g. L40S with 535.230+ reporting CUDA 12.2). See https://docs.astral.sh/uv/guides/integration/pytorch/
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

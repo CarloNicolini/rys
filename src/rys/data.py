@@ -73,6 +73,7 @@ def csqa_prompts(tokenizer: Any, n: int = 250, seed: int = 0) -> pd.DataFrame:
         )
         prompt = _chat_format(tokenizer, user_text)
         rows.append((f"csqa_{i:04d}", "csqa", prompt, ex["answerKey"]))
+    print(len(rows))
     return pd.DataFrame(rows, columns=["prompt_id", "task", "prompt", "gold"])
 
 
