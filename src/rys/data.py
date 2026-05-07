@@ -91,7 +91,10 @@ def wikitext_prompts(
     """
     ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     full_text = "\n".join(t for t in ds["text"] if t.strip())
-    chars_per_token = max(1, len(full_text) // max(1, len(tokenizer.encode(full_text[:4000]))))
+    # Estimate chars/token from the same span we tokenize. Using len(full_text) here
+    # but only encoding [:4000] inflated char_window and collapsed n chunks to ~3.
+    sample = full_text[:4000]
+    chars_per_token = max(1, len(sample) // max(1, len(tokenizer.encode(sample))))
     char_window = chunk_tokens * chars_per_token
     starts = list(range(0, len(full_text) - char_window, char_window))[:n]
     if seed:
