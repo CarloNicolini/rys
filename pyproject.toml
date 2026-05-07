@@ -33,7 +33,7 @@ dependencies = [
     "leidenalg>=0.10",
     "ruptures>=1.1",
     # Visualisation
-    "plotly>=5.24",
+    "plotly[kaleido]>=5.24",
     "kaleido==0.2.1",
     "matplotlib>=3.9",
     # Notebook
