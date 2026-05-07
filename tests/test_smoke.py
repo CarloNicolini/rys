@@ -63,10 +63,10 @@ def _fake_activations(L: int = 4, N: int = 32, d: int = 16, seed: int = 0) -> pd
     for layer in range(L):
         # Activation matrices share a common signal plus per-layer noise so the
         # CKA matrix has both a strong diagonal and meaningful off-diagonal.
-        X = rng.standard_normal((N, d)).astype(np.float32) + 0.5 * layer
+        X = rng.standard_normal((N, 3, d)).astype(np.float32) + 0.5 * layer
         for n in range(N):
-            rows.append((f"p_{n}", layer, "last", X[n]))
-    return pd.DataFrame(rows, columns=["prompt_id", "layer", "strategy", "activation"])
+            rows.append((f"p_{n}", layer, X[n]))
+    return pd.DataFrame(rows, columns=["prompt_id", "layer", "activation"])
 
 
 def test_cka_matrix_shape_and_symmetry() -> None:

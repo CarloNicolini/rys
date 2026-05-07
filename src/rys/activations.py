@@ -2,33 +2,29 @@
 
 The module exposes a single function `capture_residual_stream` that runs a forward
 pass of a HuggingFace causal-LM over a batch of prompts and returns the
-post-block residual stream activations of every requested layer, after a chosen
-token-level aggregation.
+post-block residual stream activations of every requested layer at sequence
+level.
 
 Design choices
 --------------
 - Uses `register_forward_hook` on `model.model.layers[l]`. The hook output is the
   full residual-stream tensor of shape `(batch, seq, d)` *after* block ``l``.
-- All token aggregation is left-padding aware via the `attention_mask` returned
-  by the tokenizer. We assume `tokenizer.padding_side == "left"`, which is the
-  HuggingFace default for decoder-only generation.
-- The output is a long-format DataFrame with one row per (prompt, layer, strategy)
-  triple. The activation vector is stored as an `np.ndarray` of shape `(d,)`
+- Pad tokens are removed with the `attention_mask` returned by the tokenizer.
+- The output is a long-format DataFrame with one row per (prompt, layer)
+  pair. The activation matrix is stored as an `np.ndarray` of shape `(n_tokens, d)`
   inside an ``object``-dtype column, which is the Pandas-idiomatic way to keep
-  per-row arrays without flattening them across the table.
+  per-row arrays without flattening them across the table. Prompt-level averages
+  can be computed downstream when they are scientifically needed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import ExitStack
-from typing import Literal
 
 import numpy as np
 import pandas as pd
 import torch
-
-TokenStrategy = Literal["last", "mean", "answer_tokens"]
 
 
 def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
@@ -45,34 +41,13 @@ def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
     return model.model.layers
 
 
-def _aggregate(
+def _valid_token_matrices(
     hidden: torch.Tensor,
     attention_mask: torch.Tensor,
-    strategy: TokenStrategy,
-) -> torch.Tensor:
-    """Reduce a (B, T, d) hidden tensor to (B, d) given an attention mask.
-
-    Notes
-    -----
-    - ``last``: take the last *non-pad* token of every sequence. With left
-      padding this is simply position ``-1``; we still consult the mask so the
-      function is also correct for right-padding inputs.
-    - ``mean``: mean over non-pad positions, with masked-fill of pad to zero.
-    - ``answer_tokens``: same as ``mean`` here. The notebook only requests this
-      strategy when prompts have already been augmented with the gold answer in
-      the same sequence — the caller is responsible for that framing.
-    """
-    mask = attention_mask.to(hidden.dtype).unsqueeze(-1)  # (B, T, 1)
-    if strategy == "last":
-        # Index of the last True element per row.
-        last_idx = attention_mask.sum(dim=1).long().clamp(min=1) - 1
-        gather_idx = last_idx.view(-1, 1, 1).expand(-1, 1, hidden.size(-1))
-        return hidden.gather(1, gather_idx).squeeze(1)
-    if strategy in ("mean", "answer_tokens"):
-        summed = (hidden * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1.0)
-        return summed / counts
-    raise ValueError(f"Unknown token strategy {strategy!r}")
+) -> list[torch.Tensor]:
+    """Return one ``(n_tokens, d)`` tensor per prompt after dropping pads."""
+    keep = attention_mask.bool()
+    return [row[mask] for row, mask in zip(hidden, keep, strict=True)]
 
 
 def capture_residual_stream(
@@ -80,7 +55,6 @@ def capture_residual_stream(
     tokenizer,
     prompts: pd.DataFrame,
     layer_indices: Iterable[int] | None = None,
-    aggregate: TokenStrategy = "last",
     batch_size: int = 8,
     max_length: int = 1024,
     device: str | torch.device | None = None,
@@ -102,8 +76,6 @@ def capture_residual_stream(
     layer_indices
         Subset of layers to capture. ``None`` means every layer. Negative
         indices are interpreted Python-style (``-1`` = last).
-    aggregate
-        Token-level reduction strategy; see :func:`_aggregate`.
     batch_size
         Number of prompts processed per forward pass. Memory scales with
         ``batch_size * seq_len * L * d * 4 bytes`` for FP32 outputs.
@@ -120,8 +92,8 @@ def capture_residual_stream(
     -------
     pd.DataFrame
         Long-format DataFrame with columns
-        ``[prompt_id, layer, strategy, activation]`` where ``activation`` is an
-        ``np.ndarray`` of shape ``(d,)`` per row.
+        ``[prompt_id, layer, activation]`` where ``activation`` is an
+        ``np.ndarray`` of shape ``(n_tokens, d)`` per row.
     """
     if "prompt_id" not in prompts.columns or "prompt" not in prompts.columns:
         raise ValueError("`prompts` must have columns 'prompt_id' and 'prompt'.")
@@ -141,7 +113,7 @@ def capture_residual_stream(
     captured: dict[int, list[np.ndarray]] = {layer_id: [] for layer_id in layer_indices}
 
     # Hooks fire in order; we close over a mutable batch holder to receive
-    # the input mask and aggregate in-place.
+    # the input mask and strip padding in-place.
     holder: dict[str, torch.Tensor | None] = {"mask": None}
 
     def make_hook(layer_id: int):
@@ -151,8 +123,9 @@ def capture_residual_stream(
             hidden = output[0] if isinstance(output, tuple) else output
             mask = holder["mask"]
             assert mask is not None, "Attention mask must be set before hook fires."
-            agg = _aggregate(hidden, mask, aggregate).detach().to(dtype).cpu().numpy()
-            captured[layer_id].append(agg)
+            seqs = _valid_token_matrices(hidden, mask)
+            arrays = [seq.detach().to(dtype).cpu().numpy() for seq in seqs]
+            captured[layer_id].extend(arrays)
 
         return _hook
 
@@ -174,14 +147,13 @@ def capture_residual_stream(
                     return_tensors="pt",
                 ).to(device)
                 holder["mask"] = tokenized["attention_mask"]
-                model(**tokenized)
+                model(**tokenized, use_cache=False)
                 holder["mask"] = None
 
     # Assemble the long-format DataFrame.
     rows = []
     prompt_ids = prompts_reset["prompt_id"].to_numpy()
     for layer_id in layer_indices:
-        arrs = np.concatenate([np.asarray(a) for a in captured[layer_id]], axis=0)
-        for pid, vec in zip(prompt_ids, arrs, strict=True):
-            rows.append((pid, int(layer_id), aggregate, vec))
-    return pd.DataFrame(rows, columns=["prompt_id", "layer", "strategy", "activation"])
+        for pid, matrix in zip(prompt_ids, captured[layer_id], strict=True):
+            rows.append((pid, int(layer_id), matrix))
+    return pd.DataFrame(rows, columns=["prompt_id", "layer", "activation"])
