@@ -1,4 +1,4 @@
-"""Prompt loaders for the three task distributions.
+"""Prompt loaders for task distributions.
 
 Every loader returns a long-format DataFrame with the same schema:
 
@@ -9,8 +9,7 @@ adapter logic. Splitting and chunking decisions live here so the notebook
 stays clean.
 
 The chat-templated formatting uses ``tokenizer.apply_chat_template`` with the
-official Llama-3 ``user`` role for GSM8K and CSQA. Wikitext-2 is fed as raw
-text since plain continuation has no chat semantics.
+official ``user`` role so every dataset is presented as an instruction stimulus.
 """
 
 from __future__ import annotations
@@ -73,36 +72,34 @@ def csqa_prompts(tokenizer: Any, n: int = 250, seed: int = 0) -> pd.DataFrame:
         )
         prompt = _chat_format(tokenizer, user_text)
         rows.append((f"csqa_{i:04d}", "csqa", prompt, ex["answerKey"]))
-    print(len(rows))
     return pd.DataFrame(rows, columns=["prompt_id", "task", "prompt", "gold"])
 
 
-def wikitext_prompts(
+def mmlu_prompts(
     tokenizer: Any,
+    subject: str,
     n: int = 250,
-    chunk_tokens: int = 256,
     seed: int = 0,
 ) -> pd.DataFrame:
-    """Yield ``n`` raw-text Wikitext-2 chunks of approx. ``chunk_tokens`` tokens.
+    """Sample an MMLU subject as an instruction-formatted MCQA task.
 
-    No chat template is applied — this is the plain-continuation control. We
-    use the tokenizer to estimate a character window that maps to roughly the
-    requested token budget.
+    Useful subjects for task-organ contrasts include ``high_school_mathematics``,
+    ``formal_logic``, ``philosophy``, ``moral_disputes``, and ``abstract_algebra``.
     """
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    full_text = "\n".join(t for t in ds["text"] if t.strip())
-    # Estimate chars/token from the same span we tokenize. Using len(full_text) here
-    # but only encoding [:4000] inflated char_window and collapsed n chunks to ~3.
-    sample = full_text[:4000]
-    chars_per_token = max(1, len(sample) // max(1, len(tokenizer.encode(sample))))
-    char_window = chunk_tokens * chars_per_token
-    starts = list(range(0, len(full_text) - char_window, char_window))[:n]
-    if seed:
-        rng = pd.Series(starts).sample(n=min(n, len(starts)), random_state=seed)
-        starts = rng.tolist()
+    ds = load_dataset("cais/mmlu", subject, split="test").shuffle(seed=seed)
+    ds = ds.select(range(min(n, len(ds))))
+    letters = ["A", "B", "C", "D"]
+    task = f"mmlu_{subject}"
 
     rows = []
-    for i, s in enumerate(starts):
-        chunk = full_text[s : s + char_window]
-        rows.append((f"wikitext_{i:04d}", "wikitext", chunk, ""))
+    for i, ex in enumerate(ds):
+        options = "\n".join(f"{letter}. {choice}" for letter, choice in zip(letters, ex["choices"], strict=True))
+        user_text = (
+            f"Answer this {subject.replace('_', ' ')} multiple-choice question. "
+            "Think through the problem, then end with the single correct option letter.\n\n"
+            f"Question: {ex['question']}\n\nOptions:\n{options}\n\nAnswer:"
+        )
+        prompt = _chat_format(tokenizer, user_text)
+        gold = letters[int(ex["answer"])]
+        rows.append((f"{task}_{i:04d}", task, prompt, gold))
     return pd.DataFrame(rows, columns=["prompt_id", "task", "prompt", "gold"])

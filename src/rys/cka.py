@@ -29,7 +29,7 @@ def _stack_per_layer(activations: pd.DataFrame) -> tuple[list[int], torch.Tensor
     ----------
     activations
         DataFrame with columns ``[prompt_id, layer, activation]`` as produced by
-        :func:`rys.activations.capture_residual_stream`. Each activation cell is
+        the capture functions in :mod:`rys.activations`. Each activation cell is
         an ``(n_tokens_for_prompt, d)`` matrix. Older one-vector-per-prompt
         inputs are also accepted and treated as a single-token sequence.
 

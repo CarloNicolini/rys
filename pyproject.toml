@@ -1,7 +1,7 @@
 [project]
 name = "rys"
 version = "0.1.0"
-description = "Empirical CKA connectome and Repeat-Your-Self (RYS) experiments on Llama-3.2-3B-Instruct."
+description = "Empirical generated-response CKA connectome and Repeat-Your-Self (RYS) experiments."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

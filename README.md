@@ -1,6 +1,6 @@
 # rys
 
-Empirical CKA connectomes and Repeat-Your-Self (RYS) surgery on Llama-3.2-3B-Instruct.
+Empirical generated-response CKA connectomes and Repeat-Your-Self (RYS) surgery.
 
 This repo is the experimental companion to two blog posts:
 - [How skip connections define graphs in deep networks](https://carlonicolini.github.io/sections/science/_posts/2026-04-28-Skip-connections-and-graph-analysis.md)
@@ -10,7 +10,7 @@ This repo is the experimental companion to two blog posts:
 
 The notebook [notebooks/cka_rys_connectome.ipynb](notebooks/cka_rys_connectome.ipynb) tests four falsifiable claims of the theory:
 
-1. **Task-specific reasoning module.** GSM8K should produce a wider linear-CKA plateau than CommonsenseQA (non-math reasoning) or Wikitext-2 (no reasoning).
+1. **Task-specific response modules.** Generated responses to GSM8K, CommonsenseQA, and MMLU subjects should show task-dependent linear-CKA integration/segregation patterns.
 2. **Eq. (10) plateau.** $$1-\mathrm{CKA}_{ij}\propto \mathcal{R}_{i,j}^2 \sin^2\Phi_{i,j}$$ inside the central plateau.
 3. **Eq. (14) RYS amplification.** Duplicating the central window via RYS multiplies the off-plateau distance by ~16x.
 4. **Behavioural delta.** Standard `lm-evaluation-harness` accuracy on GSM8K should improve only when the *correct* reasoning window is duplicated.
@@ -22,10 +22,10 @@ rys/
 ├── pyproject.toml          uv-managed project; deps split into core + [gpu] for bitsandbytes
 ├── uv.lock                 committed for full reproducibility
 ├── src/rys/
-│   ├── activations.py      forward-hook residual-stream capture at sequence level
+│   ├── activations.py      prompt and generated-response residual-stream capture
 │   ├── cka.py              thin wrapper over ckatorch (HSIC1 unbiased estimator)
 │   ├── surgery.py          RYS forward-pre-hook context manager
-│   ├── data.py             GSM8K / CommonsenseQA / Wikitext-2 loaders -> pandas DataFrames
+│   ├── data.py             GSM8K / CommonsenseQA / MMLU loaders -> pandas DataFrames
 │   ├── modules.py          Leiden community detection, PELT change points, plateau metric
 │   └── plots.py            plotly heatmaps, 3-panel figure, RYS delta plot
 ├── notebooks/
@@ -62,17 +62,20 @@ RYS_N_PROMPTS=32 RYS_RUN_LM_EVAL=0 uv run jupyter lab notebooks/cka_rys_connecto
 For the full 250-prompt evaluation on a single GPU:
 
 ```bash
-RYS_N_PROMPTS=250 RYS_BATCH_SIZE=8 RYS_EVAL_LIMIT=250 RYS_EVAL_FEWSHOT=8 \
+RYS_N_PROMPTS=250 RYS_BATCH_SIZE=4 RYS_MAX_NEW_TOKENS=256 RYS_EVAL_LIMIT=250 RYS_EVAL_FEWSHOT=8 \
   uv run jupyter lab notebooks/cka_rys_connectome.ipynb
 ```
 
 | variable | default | purpose |
 | :--- | :--- | :--- |
-| `RYS_MODEL` | `meta-llama/Llama-3.2-3B-Instruct` | swap to any Llama-style decoder |
-| `RYS_N_PROMPTS` | `250` | per-task prompt count for activation extraction |
-| `RYS_BATCH_SIZE` | `8` (CUDA), `2` (CPU) | forward-pass batch size |
-| `RYS_MAX_LENGTH` | `512` | tokenisation truncation length |
+| `RYS_MODEL` | `Qwen/Qwen3.6-27B` | swap to any Llama-style decoder |
+| `RYS_N_PROMPTS` | `250` | per-task prompt count for generation and activation extraction |
+| `RYS_MMLU_SUBJECTS` | `philosophy` | comma-separated MMLU subjects to add, e.g. `philosophy,formal_logic` |
+| `RYS_BATCH_SIZE` | `4` (CUDA), `1` (CPU) | generation and replay batch size |
+| `RYS_MAX_PROMPT_LENGTH` | `512` | prompt tokenisation truncation length |
+| `RYS_MAX_NEW_TOKENS` | `256` | maximum generated response length captured for CKA |
 | `RYS_REUSE_CACHE` | `1` | reuse cached parquet/JSON if present |
+| `RYS_RUN_QUANT_SANITY` | `0` | optionally run FP16-vs-INT8 check when memory allows |
 | `RYS_RUN_LM_EVAL` | `1` on CUDA | run the lm-evaluation-harness section |
 | `RYS_EVAL_LIMIT` | `250` | examples per task in lm-eval |
 | `RYS_EVAL_FEWSHOT` | `8` | few-shot examples per task |
@@ -80,16 +83,17 @@ RYS_N_PROMPTS=250 RYS_BATCH_SIZE=8 RYS_EVAL_LIMIT=250 RYS_EVAL_FEWSHOT=8 \
 ## Hardware
 
 - INT8 quantisation requires CUDA + `bitsandbytes`. Install with `uv sync --extra gpu` on a GPU box.
-- The activation extraction and the CKA computation work on CPU/MPS; lm-evaluation-harness is skipped automatically off-CUDA.
-- Llama-3.2-3B-Instruct is 6.5GB FP16 / ~3.5GB INT8.
+- The generated-response activation extraction and the CKA computation work on CPU/MPS, but large models are practical only on CUDA.
+- For 27B-class models on 24GB cards, prefer 4-bit quantisation if INT8 does not fit.
 
 ## Anti-reviewer-criticism battery (Section 6 of the notebook)
 
 | concern | mitigation |
 | :--- | :--- |
-| "Plateau is universal, not reasoning-specific." | 3-task contrast (math / non-math reasoning / continuation). |
-| "Prompt pooling erased the token-time geometry." | Section 6 checks that activation capture keeps sequence-level token matrices. |
-| "INT8 broke representations." | Section 6 spot-checks INT8 against FP16 on 32 prompts. |
+| "Plateau is universal, not reasoning-specific." | Task contrast over generated responses: math, commonsense, and MMLU subjects. |
+| "Prompt prefill is not the task response." | The notebook generates answers, replays prompt + answer, and captures only response-token states. |
+| "Prompt pooling erased the token-time geometry." | Section 6 checks that activation capture keeps sequence-level response-token matrices. |
+| "INT8 broke representations." | Optional Section 6 spot-checks INT8 against FP16 on 32 prompts when memory allows. |
 | "Centering didn't matter." | Section 6 compares uncentered cosine to linear CKA. |
 | "Statistical noise." | Bootstrap CIs on every CKA value (B=200) and accuracy delta (B=1000). |
 | "Any extra compute would help." | Negative-control RYS windows (random middle, encoder/decoder boundary). |
