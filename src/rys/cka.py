@@ -5,7 +5,7 @@ Kornblith 2020) instead of reimplementing the trace formula. This module
 exposes pandas-friendly wrappers that:
 
 1. Stack the long-format activation table from `rys.activations` into one
-   ``(N, d)`` tensor per layer.
+   ``(n_tokens, d)`` tensor per layer.
 2. Compute the full ``L x L`` symmetric CKA matrix in vectorised form.
 3. Optionally produce bootstrap 95% confidence intervals.
 
@@ -23,23 +23,23 @@ from ckatorch import cka_base
 
 
 def _stack_per_layer(activations: pd.DataFrame) -> tuple[list[int], torch.Tensor]:
-    """Pivot the long-format activations table into a (L, N, d) tensor.
+    """Pivot the long-format activations table into a (L, n_tokens, d) tensor.
 
     Parameters
     ----------
     activations
-        DataFrame with columns ``[prompt_id, layer, strategy, activation]`` as
-        produced by :func:`rys.activations.capture_residual_stream`. All rows
-        must share the same ``strategy`` value and the same set of
-        ``prompt_id``s for every layer.
+        DataFrame with columns ``[prompt_id, layer, activation]`` as produced by
+        :func:`rys.activations.capture_residual_stream`. Each activation cell is
+        an ``(n_tokens_for_prompt, d)`` matrix. Older one-vector-per-prompt
+        inputs are also accepted and treated as a single-token sequence.
 
     Returns
     -------
     layers, tensor
         Sorted list of layer indices and a ``torch.float32`` tensor of shape
-        ``(L, N, d)``.
+        ``(L, n_tokens, d)``.
     """
-    if activations["strategy"].nunique() != 1:
+    if "strategy" in activations.columns and activations["strategy"].nunique() != 1:
         raise ValueError(
             "Mixed token strategies in the activations DataFrame. "
             "Filter to a single strategy before computing CKA."
@@ -52,12 +52,18 @@ def _stack_per_layer(activations: pd.DataFrame) -> tuple[list[int], torch.Tensor
         aggfunc="first",
     )
     pivot = pivot[layers]  # enforce column order
-    # Each cell holds an np.ndarray; stack into a 3-D tensor.
+    # Each cell holds an activation matrix for one prompt. Concatenating over
+    # prompts gives the blog-post object X_l in R^{n_tokens x d}.
     arrs = np.stack(
-        [np.stack(pivot[col].to_numpy(), axis=0) for col in pivot.columns],
+        [_concat_prompt_matrices(pivot[col].to_numpy()) for col in pivot.columns],
         axis=0,
     )
     return layers, torch.from_numpy(arrs.astype(np.float32))
+
+
+def _concat_prompt_matrices(values: np.ndarray) -> np.ndarray:
+    matrices = [np.atleast_2d(np.asarray(value)) for value in values]
+    return np.concatenate(matrices, axis=0)
 
 
 def cka_matrix(
@@ -68,9 +74,8 @@ def cka_matrix(
 ) -> pd.DataFrame:
     """Return the symmetric ``L x L`` linear CKA matrix as a DataFrame.
 
-    Uses :func:`ckatorch.cka_base` with the unbiased HSIC1 estimator, which is
-    invariant to batch size and therefore the right choice when ``N`` is
-    moderate (a few hundred prompts).
+    Uses :func:`ckatorch.cka_base` with the unbiased HSIC1 estimator. The sample
+    axis is the concatenated valid-token axis, not the prompt axis.
 
     The returned DataFrame is indexed and columned by integer layer id so the
     rest of the pipeline can use ``.loc`` slicing directly.
@@ -97,7 +102,7 @@ def cka_matrix_bootstrap(
     seed: int = 0,
     device: str | torch.device = "cpu",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Bootstrap CIs on every CKA entry by resampling prompts with replacement.
+    """Bootstrap CIs on every CKA entry by resampling token rows with replacement.
 
     Returns
     -------

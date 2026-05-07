@@ -22,7 +22,7 @@ rys/
 ├── pyproject.toml          uv-managed project; deps split into core + [gpu] for bitsandbytes
 ├── uv.lock                 committed for full reproducibility
 ├── src/rys/
-│   ├── activations.py      forward-hook residual-stream capture with token aggregation
+│   ├── activations.py      forward-hook residual-stream capture at sequence level
 │   ├── cka.py              thin wrapper over ckatorch (HSIC1 unbiased estimator)
 │   ├── surgery.py          RYS forward-pre-hook context manager
 │   ├── data.py             GSM8K / CommonsenseQA / Wikitext-2 loaders -> pandas DataFrames
@@ -88,7 +88,7 @@ RYS_N_PROMPTS=250 RYS_BATCH_SIZE=8 RYS_EVAL_LIMIT=250 RYS_EVAL_FEWSHOT=8 \
 | concern | mitigation |
 | :--- | :--- |
 | "Plateau is universal, not reasoning-specific." | 3-task contrast (math / non-math reasoning / continuation). |
-| "You cherry-picked last-token aggregation." | Section 6 reruns with `mean` aggregation; reports the correlation. |
+| "Prompt pooling erased the token-time geometry." | Section 6 checks that activation capture keeps sequence-level token matrices. |
 | "INT8 broke representations." | Section 6 spot-checks INT8 against FP16 on 32 prompts. |
 | "Centering didn't matter." | Section 6 compares uncentered cosine to linear CKA. |
 | "Statistical noise." | Bootstrap CIs on every CKA value (B=200) and accuracy delta (B=1000). |
