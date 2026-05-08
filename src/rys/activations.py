@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from rys.surgery import RYS_REPLAY_FLAG
+from rys.surgery import is_in_rys_replay
 
 
 def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
@@ -176,7 +176,7 @@ def capture_residual_stream(
 
     def make_hook(layer_id: int):
         def _hook(_module, _inputs, output):
-            if getattr(model, RYS_REPLAY_FLAG, 0):
+            if is_in_rys_replay():
                 return
             # Llama returns a tuple (hidden, ...) per block. Some custom variants
             # return a tensor directly. Handle both.
@@ -265,7 +265,7 @@ def capture_generated_residual_stream(
 
     def make_hook(layer_id: int):
         def _hook(_module, _inputs, output):
-            if getattr(model, RYS_REPLAY_FLAG, 0):
+            if is_in_rys_replay():
                 return
             hidden = output[0] if isinstance(output, tuple) else output
             selection = holder["selection"]
@@ -279,71 +279,95 @@ def capture_generated_residual_stream(
 
     model.eval()
     prompts_reset = prompts.reset_index(drop=True)
-    with ExitStack() as stack:
-        for layer_id in layer_indices:
-            handle = layers[layer_id].register_forward_hook(make_hook(layer_id))
-            stack.callback(handle.remove)
+    with torch.inference_mode():
+        for start in range(0, len(prompts_reset), batch_size):
+            batch = prompts_reset.iloc[start : start + batch_size]
+            tokenized = tokenizer(
+                batch["prompt"].tolist(),
+                padding=True,
+                truncation=True,
+                max_length=max_prompt_length,
+                return_tensors="pt",
+            ).to(device)
+            input_width = tokenized["input_ids"].shape[1]
 
-        with torch.inference_mode():
-            for start in range(0, len(prompts_reset), batch_size):
-                batch = prompts_reset.iloc[start : start + batch_size]
-                tokenized = tokenizer(
-                    batch["prompt"].tolist(),
-                    padding=True,
-                    truncation=True,
-                    max_length=max_prompt_length,
-                    return_tensors="pt",
-                ).to(device)
-                input_width = tokenized["input_ids"].shape[1]
-                generated = model.generate(
-                    **tokenized,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    **generation_kwargs,
+            # Generate without activation hooks attached. This guarantees the
+            # potentially many decoding-step forward passes never touch
+            # ``captured``.
+            generated = model.generate(
+                **tokenized,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                **generation_kwargs,
+            )
+
+            replay_sequences, response_masks = [], []
+            for row, (_, item) in enumerate(batch.iterrows()):
+                prompt_ids = tokenized["input_ids"][row][tokenized["attention_mask"][row].bool()]
+                generated_ids = generated[row, input_width:]
+                if tokenizer.eos_token_id is not None:
+                    eos_positions = (generated_ids == tokenizer.eos_token_id).nonzero(as_tuple=False)
+                    if len(eos_positions):
+                        generated_ids = generated_ids[: int(eos_positions[0])]
+                full_ids = torch.cat([prompt_ids, generated_ids])
+                response_mask = torch.cat(
+                    [
+                        torch.zeros(prompt_ids.numel(), dtype=torch.bool, device=device),
+                        torch.ones(generated_ids.numel(), dtype=torch.bool, device=device),
+                    ]
+                )
+                replay_sequences.append(full_ids)
+                response_masks.append(response_mask)
+                generation_rows.append(
+                    {
+                        "prompt_id": item["prompt_id"],
+                        "task": item.get("task", ""),
+                        "gold": item.get("gold", ""),
+                        "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+                        "n_generated_tokens": int(generated_ids.numel()),
+                    }
                 )
 
-                replay_sequences, response_masks = [], []
-                for row, (_, item) in enumerate(batch.iterrows()):
-                    prompt_ids = tokenized["input_ids"][row][tokenized["attention_mask"][row].bool()]
-                    generated_ids = generated[row, input_width:]
-                    if tokenizer.eos_token_id is not None:
-                        eos_positions = (generated_ids == tokenizer.eos_token_id).nonzero(as_tuple=False)
-                        if len(eos_positions):
-                            generated_ids = generated_ids[: int(eos_positions[0])]
-                    full_ids = torch.cat([prompt_ids, generated_ids])
-                    response_mask = torch.cat(
-                        [
-                            torch.zeros(prompt_ids.numel(), dtype=torch.bool, device=device),
-                            torch.ones(generated_ids.numel(), dtype=torch.bool, device=device),
-                        ]
-                    )
-                    replay_sequences.append(full_ids)
-                    response_masks.append(response_mask)
-                    generation_rows.append(
-                        {
-                            "prompt_id": item["prompt_id"],
-                            "task": item.get("task", ""),
-                            "gold": item.get("gold", ""),
-                            "generated_text": tokenizer.decode(generated_ids, skip_special_tokens=True),
-                            "n_generated_tokens": int(generated_ids.numel()),
-                        }
-                    )
+            input_ids, attention_mask, selection_mask = _pad_token_sequences(
+                replay_sequences,
+                response_masks,
+                pad_token_id=pad_token_id,
+                padding_side=tokenizer.padding_side,
+                device=device,
+            )
 
-                input_ids, attention_mask, selection_mask = _pad_token_sequences(
-                    replay_sequences,
-                    response_masks,
-                    pad_token_id=pad_token_id,
-                    padding_side=tokenizer.padding_side,
-                    device=device,
-                )
+            # Snapshot per-layer counts so we can assert exactly ``len(batch)``
+            # new entries land per layer in this replay forward.
+            counts_before = {layer_id: len(captured[layer_id]) for layer_id in layer_indices}
+
+            with ExitStack() as stack:
+                for layer_id in layer_indices:
+                    handle = layers[layer_id].register_forward_hook(make_hook(layer_id))
+                    stack.callback(handle.remove)
                 holder["selection"] = selection_mask
-                model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                holder["selection"] = None
+                try:
+                    model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                finally:
+                    holder["selection"] = None
+
+            for layer_id in layer_indices:
+                added = len(captured[layer_id]) - counts_before[layer_id]
+                if added != len(batch):
+                    raise RuntimeError(
+                        f"Layer {layer_id} captured {added} entries for a batch of "
+                        f"{len(batch)} prompts; expected one entry per prompt. This "
+                        "usually means a forward hook fired more often than expected."
+                    )
 
     rows = []
     prompt_ids = prompts_reset["prompt_id"].to_numpy()
     for layer_id in layer_indices:
+        if len(captured[layer_id]) != len(prompt_ids):
+            raise RuntimeError(
+                f"Layer {layer_id} accumulated {len(captured[layer_id])} entries "
+                f"for {len(prompt_ids)} prompts."
+            )
         for pid, matrix in zip(prompt_ids, captured[layer_id], strict=True):
             rows.append((pid, int(layer_id), matrix))
     return (

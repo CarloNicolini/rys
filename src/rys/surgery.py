@@ -37,7 +37,20 @@ from contextlib import contextmanager
 
 import torch
 
-RYS_REPLAY_FLAG = "_rys_internal_replay_depth"
+class _RYSReplayState:
+    """Module-level reentrant counter for nested RYS layer replay.
+
+    Activation hooks read this to skip the duplicated calls performed inside
+    :func:`apply_rys`'s pre-hook, without having to introspect the model
+    object (which can be wrapped by bitsandbytes / device_map).
+    """
+
+    depth = 0
+
+
+def is_in_rys_replay() -> bool:
+    """Return ``True`` when the calling hook is inside an internal RYS replay."""
+    return _RYSReplayState.depth > 0
 
 
 def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
@@ -138,8 +151,6 @@ def apply_rys(
         yield
         return
 
-    setattr(model, RYS_REPLAY_FLAG, 0)
-
     def pre_hook(_module, args, kwargs):
         # `args` is empty when transformers calls layers with kwargs only.
         # We cover both cases for forward compatibility across versions.
@@ -154,12 +165,12 @@ def apply_rys(
 
         for _ in range(n_repeats - 1):
             for k in range(start, end):
-                setattr(model, RYS_REPLAY_FLAG, getattr(model, RYS_REPLAY_FLAG, 0) + 1)
+                _RYSReplayState.depth += 1
                 try:
                     out = layers[k](hidden, *rest_args, **_replay_kwargs(kwargs, hidden))
                     hidden = out[0] if isinstance(out, tuple) else out
                 finally:
-                    setattr(model, RYS_REPLAY_FLAG, getattr(model, RYS_REPLAY_FLAG, 1) - 1)
+                    _RYSReplayState.depth -= 1
 
         if args:
             return (hidden, *rest_args), kwargs
@@ -172,5 +183,5 @@ def apply_rys(
         yield
     finally:
         handle.remove()
-        if hasattr(model, RYS_REPLAY_FLAG):
-            delattr(model, RYS_REPLAY_FLAG)
+        # Reset the counter in case an exception left it dangling.
+        _RYSReplayState.depth = 0
