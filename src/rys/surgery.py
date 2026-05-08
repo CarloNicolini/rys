@@ -47,6 +47,30 @@ def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
     return model.model.layers
 
 
+def _replay_kwargs(kwargs: dict) -> dict:
+    """Return kwargs safe for the inner RYS replay loop.
+
+    Transformer generation may pass integer masks into decoder layers. The
+    normal model path can tolerate those in some implementations, but replaying
+    a layer directly can route them to PyTorch SDPA, which accepts only bool or
+    floating masks. We normalize only the replay copy so the outer model call
+    remains untouched.
+    """
+    replay = dict(kwargs)
+    mask = replay.get("attention_mask")
+    if isinstance(mask, torch.Tensor) and not (mask.dtype == torch.bool or mask.is_floating_point()):
+        replay["attention_mask"] = torch.logical_not(mask.bool()).to(mask.device)
+
+    # Hook-based RYS is a full-sequence replay. Reusing generation KV caches in
+    # the duplicated block would update/cache the wrong trajectory.
+    if "past_key_values" in replay:
+        replay["past_key_values"] = None
+    if "use_cache" in replay:
+        replay["use_cache"] = False
+
+    return replay
+
+
 @contextmanager
 def apply_rys(
     model: torch.nn.Module,
@@ -104,7 +128,7 @@ def apply_rys(
 
         for _ in range(n_repeats - 1):
             for k in range(start, end):
-                out = layers[k](hidden, *rest_args, **kwargs)
+                out = layers[k](hidden, *rest_args, **_replay_kwargs(kwargs))
                 hidden = out[0] if isinstance(out, tuple) else out
 
         if args:

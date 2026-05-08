@@ -225,7 +225,8 @@ def capture_generated_residual_stream(
     This is the task-evoked counterpart of :func:`capture_residual_stream`.
     Generation decides what the model actually says; a second no-cache forward
     pass over ``prompt + response`` captures complete hidden states for the
-    generated response span only.
+    generated response span only. Generation also defaults to ``use_cache=False``
+    because the hook-based RYS surgery replays full residual streams.
 
     Returns
     -------
@@ -242,7 +243,7 @@ def capture_generated_residual_stream(
     layer_indices = _normalise_layer_indices(layers, layer_indices)
     device = device or next(model.parameters()).device
     dtype = dtype or torch.float32
-    generation_kwargs = generation_kwargs or {}
+    generation_kwargs = {"use_cache": False, **(generation_kwargs or {})}
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
