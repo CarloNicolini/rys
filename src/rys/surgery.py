@@ -47,7 +47,26 @@ def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
     return model.model.layers
 
 
-def _replay_kwargs(kwargs: dict) -> dict:
+def _causal_allowed_mask(attention_mask: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+    """Build a bool SDPA mask with True entries where attention is allowed."""
+    batch, seq_len = hidden.shape[:2]
+    key_is_real = attention_mask.bool()
+    if key_is_real.shape != (batch, seq_len):
+        key_is_real = key_is_real[:, -seq_len:]
+
+    causal = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden.device).tril()
+    allowed = causal.unsqueeze(0) & key_is_real[:, None, :]
+
+    # Fully padded query rows can otherwise have no allowed keys, which some
+    # SDPA backends dislike. Those rows are ignored downstream, so self-attend.
+    empty_rows = ~allowed.any(dim=-1)
+    if empty_rows.any():
+        diag = torch.eye(seq_len, dtype=torch.bool, device=hidden.device).unsqueeze(0)
+        allowed = torch.where(empty_rows.unsqueeze(-1), diag.expand(batch, -1, -1), allowed)
+    return allowed[:, None, :, :]
+
+
+def _replay_kwargs(kwargs: dict, hidden: torch.Tensor) -> dict:
     """Return kwargs safe for the inner RYS replay loop.
 
     Transformer generation may pass integer masks into decoder layers. The
@@ -58,8 +77,11 @@ def _replay_kwargs(kwargs: dict) -> dict:
     """
     replay = dict(kwargs)
     mask = replay.get("attention_mask")
-    if isinstance(mask, torch.Tensor) and not (mask.dtype == torch.bool or mask.is_floating_point()):
-        replay["attention_mask"] = torch.logical_not(mask.bool()).to(mask.device)
+    if isinstance(mask, torch.Tensor):
+        if mask.ndim == 2:
+            replay["attention_mask"] = _causal_allowed_mask(mask.to(hidden.device), hidden)
+        elif not (mask.dtype == torch.bool or mask.is_floating_point()):
+            replay["attention_mask"] = mask.bool()
 
     # Hook-based RYS is a full-sequence replay. Reusing generation KV caches in
     # the duplicated block would update/cache the wrong trajectory.
@@ -128,7 +150,7 @@ def apply_rys(
 
         for _ in range(n_repeats - 1):
             for k in range(start, end):
-                out = layers[k](hidden, *rest_args, **_replay_kwargs(kwargs))
+                out = layers[k](hidden, *rest_args, **_replay_kwargs(kwargs, hidden))
                 hidden = out[0] if isinstance(out, tuple) else out
 
         if args:
