@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 import torch
 
+from rys.surgery import RYS_REPLAY_FLAG
+
 
 def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
     """Return the residual-block list for a HuggingFace decoder-only model.
@@ -57,6 +59,13 @@ def _selected_token_matrices(
 ) -> list[torch.Tensor]:
     """Return one ``(n_selected_tokens, d)`` tensor per prompt."""
     keep = selection_mask.bool()
+    if keep.shape[0] != hidden.shape[0]:
+        raise ValueError(
+            "Selection mask batch size does not match hidden-state batch size: "
+            f"{keep.shape[0]} != {hidden.shape[0]}."
+        )
+    if keep.shape[1] != hidden.shape[1]:
+        keep = keep[:, -hidden.shape[1] :]
     return [row[mask] for row, mask in zip(hidden, keep, strict=True)]
 
 
@@ -167,6 +176,8 @@ def capture_residual_stream(
 
     def make_hook(layer_id: int):
         def _hook(_module, _inputs, output):
+            if getattr(model, RYS_REPLAY_FLAG, 0):
+                return
             # Llama returns a tuple (hidden, ...) per block. Some custom variants
             # return a tensor directly. Handle both.
             hidden = output[0] if isinstance(output, tuple) else output
@@ -254,6 +265,8 @@ def capture_generated_residual_stream(
 
     def make_hook(layer_id: int):
         def _hook(_module, _inputs, output):
+            if getattr(model, RYS_REPLAY_FLAG, 0):
+                return
             hidden = output[0] if isinstance(output, tuple) else output
             selection = holder["selection"]
             if selection is None:
