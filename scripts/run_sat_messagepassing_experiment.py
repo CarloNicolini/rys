@@ -1,0 +1,610 @@
+"""Depth-controlled clause-variable message-passing SAT experiment for RYS.
+
+The solver is trained to produce *any* satisfying assignment (validity), not a
+canonical one.  For each trained depth the script records:
+
+- a validity-vs-rounds curve (assignment quality read out after each round);
+- the validation CKA connectome over variable states;
+- strict upper-triangular RYS Delta matrices (validity, bit, exact).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+from rys.cka import cka_matrix
+from rys.sat_data import (
+    SatAssignmentDataset,
+    make_sat_assignment_examples,
+    make_sat_assignment_splits,
+    soft_sat_loss,
+    verify_assignment_tensor,
+)
+from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=43)
+    parser.add_argument("--depths", type=str, default="8,16,32")
+    parser.add_argument("--n-vars", type=int, default=6)
+    parser.add_argument("--n-clauses", type=int, default=24)
+    parser.add_argument("--ood-vars", type=int, default=8)
+    parser.add_argument("--ood-clauses", type=int, default=34)
+    parser.add_argument("--n-train", type=int, default=4096)
+    parser.add_argument("--n-val", type=int, default=1024)
+    parser.add_argument("--n-test", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--d-mlp", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--max-repeat", type=int, default=2)
+    parser.add_argument("--capture-batches", type=int, default=4)
+    parser.add_argument("--deep-supervision", action="store_true", default=True)
+    parser.add_argument("--no-deep-supervision", dest="deep_supervision", action="store_false")
+    parser.add_argument("--skip-rys", action="store_true", help="Train and export curves/CKA without RYS matrices.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Load these weights and skip training (single --depths value). Lets you re-run the RYS sweep with a different --max-repeat without retraining.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_messagepassing"))
+    return parser.parse_args()
+
+
+def resolve_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def seed_everything(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def parse_depths(value: str) -> list[int]:
+    depths = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not depths or any(depth < 2 for depth in depths):
+        raise ValueError("Depths must contain integers >= 2.")
+    return depths
+
+
+def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, int]:
+    max_vars = max(args.n_vars, args.ood_vars)
+    max_clauses = max(args.n_clauses, args.ood_clauses)
+    splits = make_sat_assignment_splits(
+        n_train=args.n_train,
+        n_val=args.n_val,
+        n_test=args.n_test,
+        n_vars=args.n_vars,
+        n_clauses=args.n_clauses,
+        seed=args.seed,
+    )
+    splits["ood"] = make_sat_assignment_examples(
+        args.n_test,
+        n_vars=args.ood_vars,
+        n_clauses=args.ood_clauses,
+        seed=args.seed + 3,
+        prefix="ood",
+    )
+    datasets = {
+        name: SatAssignmentDataset(examples, max_vars=max_vars, max_clauses=max_clauses)
+        for name, examples in splits.items()
+    }
+    loaders = {
+        "train": DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True),
+        "val": DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False),
+        "test": DataLoader(datasets["test"], batch_size=args.batch_size, shuffle=False),
+        "ood": DataLoader(datasets["ood"], batch_size=args.batch_size, shuffle=False),
+    }
+    return loaders, max_vars, max_clauses
+
+
+def build_model(args: argparse.Namespace, *, n_rounds: int, max_vars: int, max_clauses: int) -> tuple[MessagePassingSatModel, dict]:
+    config = MessagePassingConfig(
+        max_vars=max_vars,
+        max_clauses=max_clauses,
+        d_model=args.d_model,
+        n_rounds=n_rounds,
+        d_mlp=args.d_mlp,
+        dropout=args.dropout,
+    )
+    return MessagePassingSatModel(config), config.__dict__
+
+
+def count_parameters(model: torch.nn.Module) -> dict[str, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {"total": total, "trainable": trainable}
+
+
+def clause_tensors(batch: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        batch["clause_variable_ids"].to(device),
+        batch["clause_sign_ids"].to(device),
+        batch["clause_mask"].to(device),
+    )
+
+
+def batch_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    clause_variable_ids: torch.Tensor,
+    clause_sign_ids: torch.Tensor,
+    clause_mask: torch.Tensor,
+) -> dict[str, int]:
+    preds = logits.argmax(dim=-1)
+    bit_correct = int(((preds == labels) & mask).sum().detach().cpu())
+    exact = ((preds == labels) | ~mask).all(dim=1)
+    valid = verify_assignment_tensor(preds, clause_variable_ids, clause_sign_ids, clause_mask)
+    return {
+        "bit_correct": bit_correct,
+        "bit_total": int(mask.sum().detach().cpu()),
+        "exact_correct": int(exact.sum().detach().cpu()),
+        "valid_correct": int(valid.sum().detach().cpu()),
+        "example_total": int(labels.shape[0]),
+    }
+
+
+def accumulate(total_loss: float, counts: dict[str, int]) -> dict[str, float]:
+    return {
+        "loss": total_loss / counts["example_total"],
+        "bit_accuracy": counts["bit_correct"] / counts["bit_total"],
+        "exact_match": counts["exact_correct"] / counts["example_total"],
+        "valid_assignment_rate": counts["valid_correct"] / counts["example_total"],
+    }
+
+
+def empty_counts() -> dict[str, int]:
+    return {"bit_correct": 0, "bit_total": 0, "exact_correct": 0, "valid_correct": 0, "example_total": 0}
+
+
+def supervised_loss(
+    round_logits: list[torch.Tensor],
+    final_logits: torch.Tensor,
+    cvi: torch.Tensor,
+    csi: torch.Tensor,
+    cm: torch.Tensor,
+    *,
+    deep_supervision: bool,
+) -> torch.Tensor:
+    if deep_supervision and round_logits:
+        terms = [soft_sat_loss(logit, cvi, csi, cm) for logit in round_logits]
+        return torch.stack(terms).mean()
+    return soft_sat_loss(final_logits, cvi, csi, cm)
+
+
+def train_epoch(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    *,
+    deep_supervision: bool,
+) -> dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    counts = empty_counts()
+    for batch in loader:
+        labels = batch["assignment_labels"].to(device)
+        mask = batch["assignment_mask"].to(device)
+        cvi, csi, cm = clause_tensors(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+        outputs = model(
+            clause_variable_ids=cvi,
+            clause_sign_ids=csi,
+            clause_mask=cm,
+            return_round_logits=deep_supervision,
+        )
+        logits = outputs["logits"]
+        loss = supervised_loss(
+            outputs["round_logits"] or [],
+            logits,
+            cvi,
+            csi,
+            cm,
+            deep_supervision=deep_supervision,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += float(loss.detach().cpu()) * labels.shape[0]
+        for key, value in batch_metrics(logits, labels, mask, cvi, csi, cm).items():
+            counts[key] += value
+    return accumulate(total_loss, counts)
+
+
+@torch.inference_mode()
+def evaluate(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    rys_window: tuple[int, int] | None = None,
+    n_repeats: int = 2,
+) -> dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    counts = empty_counts()
+    for batch in loader:
+        labels = batch["assignment_labels"].to(device)
+        mask = batch["assignment_mask"].to(device)
+        cvi, csi, cm = clause_tensors(batch, device)
+        if rys_window is None or n_repeats == 1:
+            logits = model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm)["logits"]
+        else:
+            logits = forward_logits_with_inclusive_rys(model, cvi, csi, cm, window=rys_window, n_repeats=n_repeats)
+        loss = soft_sat_loss(logits, cvi, csi, cm)
+        total_loss += float(loss.detach().cpu()) * labels.shape[0]
+        for key, value in batch_metrics(logits, labels, mask, cvi, csi, cm).items():
+            counts[key] += value
+    return accumulate(total_loss, counts)
+
+
+def forward_logits_with_inclusive_rys(
+    model: MessagePassingSatModel,
+    cvi: torch.Tensor,
+    csi: torch.Tensor,
+    cm: torch.Tensor,
+    *,
+    window: tuple[int, int],
+    n_repeats: int,
+) -> torch.Tensor:
+    start, end = window
+    backbone = model.model
+    layers = backbone.layers
+    if start >= end:
+        raise ValueError(f"RYS window must have start < end; got {window}.")
+    if not (0 <= start < end < len(layers)):
+        raise ValueError(f"Bad inclusive window {window} for L={len(layers)}.")
+
+    context = backbone.build_context(cvi, csi, cm)
+    batch = cvi.shape[0]
+    d = backbone.config.d_model
+    var_states = backbone.var_init.view(1, 1, d).expand(batch, backbone.config.max_vars, d)
+    clause_states = backbone.clause_init.view(1, 1, d).expand(batch, backbone.config.max_clauses, d)
+    hidden = torch.cat([var_states, clause_states], dim=1).contiguous()
+
+    for idx, layer in enumerate(layers):
+        layer.ctx = context
+        hidden = layer(hidden, attention_mask=None)[0]
+        if idx == end:
+            for _ in range(n_repeats - 1):
+                for replay_idx in range(start, end + 1):
+                    hidden = layers[replay_idx](hidden, attention_mask=None)[0]
+    var_states = backbone.norm(hidden[:, : backbone.config.max_vars])
+    return model.assignment_head(var_states)
+
+
+@torch.inference_mode()
+def validity_vs_rounds(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    n_rounds: int,
+) -> pd.DataFrame:
+    model.eval()
+    per_round = [empty_counts() for _ in range(n_rounds)]
+    for batch in loader:
+        labels = batch["assignment_labels"].to(device)
+        mask = batch["assignment_mask"].to(device)
+        cvi, csi, cm = clause_tensors(batch, device)
+        outputs = model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm, return_round_logits=True)
+        for round_idx, logits in enumerate(outputs["round_logits"]):
+            for key, value in batch_metrics(logits, labels, mask, cvi, csi, cm).items():
+                per_round[round_idx][key] += value
+    rows = []
+    for round_idx, counts in enumerate(per_round):
+        metrics = accumulate(0.0, counts)
+        rows.append(
+            {
+                "round": round_idx + 1,
+                "valid_assignment_rate": metrics["valid_assignment_rate"],
+                "bit_accuracy": metrics["bit_accuracy"],
+                "exact_match": metrics["exact_match"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+@torch.inference_mode()
+def capture_variable_states(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    max_batches: int,
+) -> pd.DataFrame:
+    model.eval()
+    rows = []
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= max_batches:
+            break
+        cvi, csi, cm = clause_tensors(batch, device)
+        outputs = model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm, return_hidden_states=True)
+        trace = outputs["hidden_states"]
+        prompt_ids = [str(x) for x in batch["prompt_id"]]
+        mask = batch["assignment_mask"].bool()
+        for layer_idx, hidden in enumerate(trace):
+            for row_idx, prompt_id in enumerate(prompt_ids):
+                rows.append(
+                    {
+                        "prompt_id": prompt_id,
+                        "layer": layer_idx,
+                        "activation": hidden[row_idx, mask[row_idx]].detach().cpu().numpy(),
+                        "strategy": "variable",
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def strict_upper_windows(n_layers: int) -> list[tuple[int, int]]:
+    return [(i, j) for i in range(n_layers) for j in range(i + 1, n_layers)]
+
+
+def delta_matrices(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    n_layers: int,
+    n_repeats: int,
+) -> tuple[dict[str, pd.DataFrame], dict[str, float], pd.DataFrame]:
+    baseline = evaluate(model, loader, device)
+    matrices = {key: np.full((n_layers, n_layers), np.nan) for key in ("valid_assignment_rate", "bit_accuracy", "exact_match")}
+    rows = []
+    for start, end in strict_upper_windows(n_layers):
+        metrics = evaluate(model, loader, device, rys_window=(start, end), n_repeats=n_repeats)
+        for key in matrices:
+            matrices[key][start, end] = metrics[key] - baseline[key]
+        rows.append(
+            {
+                "start": start,
+                "end": end,
+                "n_repeats": n_repeats,
+                "baseline_valid_assignment_rate": baseline["valid_assignment_rate"],
+                "rys_valid_assignment_rate": metrics["valid_assignment_rate"],
+                "delta_valid_assignment_rate": metrics["valid_assignment_rate"] - baseline["valid_assignment_rate"],
+                "delta_bit_accuracy": metrics["bit_accuracy"] - baseline["bit_accuracy"],
+                "delta_exact_match": metrics["exact_match"] - baseline["exact_match"],
+                "rys_loss": metrics["loss"],
+            }
+        )
+        print(json.dumps(rows[-1]))
+    frames = {key: pd.DataFrame(value) for key, value in matrices.items()}
+    return frames, baseline, pd.DataFrame(rows)
+
+
+def save_heatmap(matrix: pd.DataFrame, path: Path, *, title: str, cbar_label: str, cmap: str = "RdBu_r", diverging: bool = True) -> None:
+    values = matrix.to_numpy(dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        raise ValueError(f"No finite values to plot for {path}.")
+    if diverging:
+        bound = max(abs(float(finite.min())), abs(float(finite.max())), 1e-6)
+        vmin, vmax = -bound, bound
+    else:
+        vmin, vmax = float(finite.min()), float(finite.max())
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xlabel("end round j (inclusive)")
+    ax.set_ylabel("start round i")
+    ax.set_xticks(range(matrix.shape[1]))
+    ax.set_yticks(range(matrix.shape[0]))
+    fig.colorbar(im, ax=ax, label=cbar_label)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_round_curve(curves: dict[str, pd.DataFrame], path: Path, *, depth: int) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for split, frame in curves.items():
+        ax.plot(frame["round"], frame["valid_assignment_rate"], marker="o", label=split)
+    ax.set_title(f"Validity vs message-passing rounds (L={depth})")
+    ax.set_xlabel("round")
+    ax.set_ylabel("valid assignment rate")
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def train_one_depth(
+    args: argparse.Namespace,
+    *,
+    n_rounds: int,
+    loaders: dict[str, DataLoader],
+    max_vars: int,
+    max_clauses: int,
+    device: torch.device,
+    run_dir: Path,
+) -> dict:
+    depth_dir = run_dir / f"L{n_rounds:02d}"
+    depth_dir.mkdir(parents=True, exist_ok=True)
+    model, config = build_model(args, n_rounds=n_rounds, max_vars=max_vars, max_clauses=max_clauses)
+    model.to(device)
+    params = count_parameters(model)
+    print(json.dumps({"depth": n_rounds, "n_params_total": params["total"], "n_params_trainable": params["trainable"]}))
+
+    checkpoint_path = depth_dir / "checkpoint.pt"
+    if args.checkpoint is not None:
+        # Inference-only: load existing weights and skip training so the RYS
+        # sweep can be re-run with a different --max-repeat at no training cost.
+        payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(payload["model_state_dict"])
+        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+        print(json.dumps({"depth": n_rounds, "loaded_checkpoint": str(args.checkpoint)}))
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        history = []
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = train_epoch(model, loaders["train"], optimizer, device, deep_supervision=args.deep_supervision)
+            val_metrics = evaluate(model, loaders["val"], device)
+            row = {
+                "epoch": epoch,
+                **{f"train_{key}": value for key, value in train_metrics.items()},
+                **{f"val_{key}": value for key, value in val_metrics.items()},
+            }
+            history.append(row)
+            print(json.dumps({"depth": n_rounds, **row}))
+        pd.DataFrame(history).to_csv(depth_dir / "train_history.csv", index=False)
+        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+
+    reloaded, _ = build_model(args, n_rounds=n_rounds, max_vars=max_vars, max_clauses=max_clauses)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    reloaded.load_state_dict(payload["model_state_dict"])
+    reloaded.to(device)
+
+    curves = {
+        split: validity_vs_rounds(reloaded, loaders[split], device, n_rounds=n_rounds)
+        for split in ("val", "test", "ood")
+    }
+    for split, frame in curves.items():
+        frame.to_csv(depth_dir / f"validity_vs_rounds_{split}.csv", index=False)
+    save_round_curve(curves, depth_dir / "validity_vs_rounds.png", depth=n_rounds)
+
+    activations = capture_variable_states(reloaded, loaders["val"], device, max_batches=args.capture_batches)
+    activations.to_pickle(depth_dir / "variable_activations.pkl")
+    cka = cka_matrix(activations, unbiased=False, device="cpu")
+    cka.to_csv(depth_dir / "cka_variable_val.csv")
+    save_heatmap(
+        cka,
+        depth_dir / "cka_variable_val.png",
+        title=f"Variable-state CKA (L={n_rounds})",
+        cbar_label="CKA",
+        cmap="viridis",
+        diverging=False,
+    )
+
+    baselines = {split: evaluate(reloaded, loaders[split], device) for split in ("val", "test", "ood")}
+    if args.skip_rys:
+        summary = {
+            "depth": n_rounds,
+            "config": config,
+            "n_params": params,
+            "checkpoint": str(checkpoint_path),
+            "baselines": baselines,
+            "best_rows": [],
+            "n_rys_windows": 0,
+            "rys_skipped": True,
+        }
+        (depth_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        return summary
+
+    best_rows = []
+    for split in ("val", "test", "ood"):
+        frames, baseline, long = delta_matrices(reloaded, loaders[split], device, n_layers=n_rounds, n_repeats=args.max_repeat)
+        baselines[split] = baseline
+        long.to_csv(depth_dir / f"delta_{split}_long.csv", index=False)
+        frames["valid_assignment_rate"].to_csv(depth_dir / f"delta_valid_{split}.csv")
+        save_heatmap(
+            frames["valid_assignment_rate"],
+            depth_dir / f"delta_valid_{split}.png",
+            title=f"RYS ΔValidity {split} (L={n_rounds}, i<j)",
+            cbar_label="Δ valid assignment rate",
+        )
+        best = long.loc[long["delta_valid_assignment_rate"].idxmax()].to_dict()
+        best["split"] = split
+        best_rows.append(best)
+
+    summary = {
+        "depth": n_rounds,
+        "config": config,
+        "n_params": params,
+        "checkpoint": str(checkpoint_path),
+        "baselines": baselines,
+        "best_rows": best_rows,
+        "n_rys_windows": len(strict_upper_windows(n_rounds)),
+        "rys_skipped": False,
+    }
+    (depth_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    return summary
+
+
+def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace) -> None:
+    lines = [
+        "# Clause-Variable Message-Passing SAT Depth Sweep",
+        "",
+        "Task: produce any assignment that satisfies a satisfiable 3-SAT formula.",
+        "Primary metric: valid-assignment rate (verified, not canonical exact match).",
+        "",
+        f"- Depths (rounds): `{args.depths}`",
+        f"- Train/val/test/OOD: `{args.n_train}/{args.n_val}/{args.n_test}/{args.n_test}`",
+        f"- In-distribution: `{args.n_vars}` vars, `{args.n_clauses}` clauses",
+        f"- OOD: `{args.ood_vars}` vars, `{args.ood_clauses}` clauses",
+        f"- Deep supervision: `{args.deep_supervision}`",
+        "",
+        "| depth | val valid | test valid | OOD valid | best val window | best test window | best OOD window |",
+        "| ---: | ---: | ---: | ---: | --- | --- | --- |",
+    ]
+    for summary in summaries:
+        baselines = summary["baselines"]
+        best = {row["split"]: row for row in summary["best_rows"]}
+
+        def _window(split: str) -> str:
+            if summary.get("rys_skipped"):
+                return "skipped"
+            row = best[split]
+            return f"({int(row['start'])}, {int(row['end'])}) Δ={row['delta_valid_assignment_rate']:+.3f}"
+
+        lines.append(
+            f"| {summary['depth']} | "
+            f"{baselines['val']['valid_assignment_rate']:.3f} | "
+            f"{baselines['test']['valid_assignment_rate']:.3f} | "
+            f"{baselines['ood']['valid_assignment_rate']:.3f} | "
+            f"{_window('val')} | {_window('test')} | {_window('ood')} |"
+        )
+    (run_dir / "report.md").write_text("\n".join(lines) + "\n")
+
+
+def main() -> None:
+    args = parse_args()
+    seed_everything(args.seed)
+    device = resolve_device()
+    depths = parse_depths(args.depths)
+    run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    loaders, max_vars, max_clauses = make_loaders(args)
+    summaries = []
+    for depth in depths:
+        summaries.append(
+            train_one_depth(
+                args,
+                n_rounds=depth,
+                loaders=loaders,
+                max_vars=max_vars,
+                max_clauses=max_clauses,
+                device=device,
+                run_dir=run_dir,
+            )
+        )
+    (run_dir / "summary.json").write_text(json.dumps({"args": vars(args), "summaries": summaries}, indent=2, default=str))
+    write_report(run_dir, summaries, args)
+    print(f"Wrote {run_dir}")
+
+
+if __name__ == "__main__":
+    main()

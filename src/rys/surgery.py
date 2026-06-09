@@ -37,21 +37,6 @@ from contextlib import contextmanager
 
 import torch
 
-class _RYSReplayState:
-    """Module-level reentrant counter for nested RYS layer replay.
-
-    Activation hooks read this to skip the duplicated calls performed inside
-    :func:`apply_rys`'s pre-hook, without having to introspect the model
-    object (which can be wrapped by bitsandbytes / device_map).
-    """
-
-    depth = 0
-
-
-def is_in_rys_replay() -> bool:
-    """Return ``True`` when the calling hook is inside an internal RYS replay."""
-    return _RYSReplayState.depth > 0
-
 
 def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
@@ -60,52 +45,6 @@ def _resolve_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
             f"{type(model).__name__}; provide a Llama-style decoder."
         )
     return model.model.layers
-
-
-def _causal_allowed_mask(attention_mask: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
-    """Build a bool SDPA mask with True entries where attention is allowed."""
-    batch, seq_len = hidden.shape[:2]
-    key_is_real = attention_mask.bool()
-    if key_is_real.shape != (batch, seq_len):
-        key_is_real = key_is_real[:, -seq_len:]
-
-    causal = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden.device).tril()
-    allowed = causal.unsqueeze(0) & key_is_real[:, None, :]
-
-    # Fully padded query rows can otherwise have no allowed keys, which some
-    # SDPA backends dislike. Those rows are ignored downstream, so self-attend.
-    empty_rows = ~allowed.any(dim=-1)
-    if empty_rows.any():
-        diag = torch.eye(seq_len, dtype=torch.bool, device=hidden.device).unsqueeze(0)
-        allowed = torch.where(empty_rows.unsqueeze(-1), diag.expand(batch, -1, -1), allowed)
-    return allowed[:, None, :, :]
-
-
-def _replay_kwargs(kwargs: dict, hidden: torch.Tensor) -> dict:
-    """Return kwargs safe for the inner RYS replay loop.
-
-    Transformer generation may pass integer masks into decoder layers. The
-    normal model path can tolerate those in some implementations, but replaying
-    a layer directly can route them to PyTorch SDPA, which accepts only bool or
-    floating masks. We normalize only the replay copy so the outer model call
-    remains untouched.
-    """
-    replay = dict(kwargs)
-    mask = replay.get("attention_mask")
-    if isinstance(mask, torch.Tensor):
-        if mask.ndim == 2:
-            replay["attention_mask"] = _causal_allowed_mask(mask.to(hidden.device), hidden)
-        elif not (mask.dtype == torch.bool or mask.is_floating_point()):
-            replay["attention_mask"] = mask.bool()
-
-    # Hook-based RYS is a full-sequence replay. Reusing generation KV caches in
-    # the duplicated block would update/cache the wrong trajectory.
-    if "past_key_values" in replay:
-        replay["past_key_values"] = None
-    if "use_cache" in replay:
-        replay["use_cache"] = False
-
-    return replay
 
 
 @contextmanager
@@ -165,12 +104,8 @@ def apply_rys(
 
         for _ in range(n_repeats - 1):
             for k in range(start, end):
-                _RYSReplayState.depth += 1
-                try:
-                    out = layers[k](hidden, *rest_args, **_replay_kwargs(kwargs, hidden))
-                    hidden = out[0] if isinstance(out, tuple) else out
-                finally:
-                    _RYSReplayState.depth -= 1
+                out = layers[k](hidden, *rest_args, **kwargs)
+                hidden = out[0] if isinstance(out, tuple) else out
 
         if args:
             return (hidden, *rest_args), kwargs
@@ -183,5 +118,3 @@ def apply_rys(
         yield
     finally:
         handle.remove()
-        # Reset the counter in case an exception left it dangling.
-        _RYSReplayState.depth = 0

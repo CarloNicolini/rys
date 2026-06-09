@@ -19,7 +19,7 @@ The notebook [notebooks/cka_rys_connectome.ipynb](notebooks/cka_rys_connectome.i
 
 ```
 rys/
-├── pyproject.toml          uv-managed project; CUDA torch + bitsandbytes auto-gated to Linux
+├── pyproject.toml          uv-managed project; deps split into core + [gpu] for bitsandbytes
 ├── uv.lock                 committed for full reproducibility
 ├── src/rys/
 │   ├── activations.py      prompt and generated-response residual-stream capture
@@ -45,16 +45,11 @@ rys/
 
 ```bash
 cd ~/workspace/rys
-uv sync                  # picks the right wheels for your platform
+uv sync                  # CPU/MPS only
+uv sync --extra gpu      # also installs bitsandbytes for INT8 quantisation (CUDA)
 uv run python -m ipykernel install --user --name rys --display-name "Python (rys)"
 uv run pytest tests/     # 6 smoke tests, ~10s
 ```
-
-`uv sync` resolves the platform-specific bits automatically: on Linux it pulls the
-CUDA 12.6 torch wheels and `bitsandbytes`; on macOS it pulls the default PyPI torch
-(with MPS support) and skips `bitsandbytes` entirely, since it only ships CUDA
-wheels. The notebook's INT8 path is already gated by `USE_INT8 = DEVICE.type == "cuda"`,
-so the macOS install runs end-to-end on MPS / CPU without code changes.
 
 ## Running the experiment
 
@@ -87,7 +82,7 @@ RYS_N_PROMPTS=250 RYS_BATCH_SIZE=4 RYS_MAX_NEW_TOKENS=256 RYS_EVAL_LIMIT=250 RYS
 
 ## Hardware
 
-- INT8 quantisation requires CUDA + `bitsandbytes`. The Linux `uv sync` installs both automatically; on macOS `bitsandbytes` is skipped and the notebook stays in plain torch (MPS / CPU).
+- INT8 quantisation requires CUDA + `bitsandbytes`. Install with `uv sync --extra gpu` on a GPU box.
 - The generated-response activation extraction and the CKA computation work on CPU/MPS, but large models are practical only on CUDA.
 - For 27B-class models on 24GB cards, prefer 4-bit quantisation if INT8 does not fit.
 

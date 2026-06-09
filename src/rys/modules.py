@@ -10,7 +10,8 @@ Three primitives:
   this localises encoder/reasoning/decoder boundaries.
 - :func:`plateau_metric` — the off-plateau scalar
   ``1 - mean(M[i, j])`` over the rectangle ``window^2``. By the blog post's
-  Eq. (14) this should be amplified by ~16x under RYS.
+  Eq. (7) this should be amplified by ~4x under RYS in the typical
+  incoherent regime that empirical LLM residual streams occupy.
 """
 
 from __future__ import annotations
@@ -115,10 +116,11 @@ def change_points(
 def plateau_metric(M: pd.DataFrame, window: tuple[int, int]) -> float:
     """Return ``1 - mean(M[i, j])`` over the closed rectangle ``window^2``.
 
-    By the post's Eq. (14) this value should be amplified by ~16x when RYS
-    duplicates the same window. The metric is invariant to which window
-    boundary convention the caller uses (closed or half-open) because both
-    reduce to the same averaged sub-block in the limit of large windows.
+    By the post's Eq. (7) this value should be amplified by ~4x when RYS
+    duplicates the same window in the typical incoherent regime. The metric
+    is invariant to which window boundary convention the caller uses
+    (closed or half-open) because both reduce to the same averaged sub-block
+    in the limit of large windows.
     """
     start, end = window
     block = M.loc[start:end, start:end].to_numpy()
