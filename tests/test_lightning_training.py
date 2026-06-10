@@ -36,7 +36,7 @@ from rys.training.modules import (
     SatMPLitModule,
     SortedTranslationLitModule,
 )
-from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model, resolve_training_checkpoint
 
 
 def test_classifier_lightning_checkpoint_roundtrip(tmp_path: Path) -> None:
@@ -170,6 +170,18 @@ def test_sorted_translation_lightning_multi_loader_fit(tmp_path: Path) -> None:
     )
     trainer.fit(lit, train_dataloaders=train_loaders, val_dataloaders=val_loader)
     assert best_checkpoint_path(trainer).exists()
+
+
+def test_resolve_training_checkpoint_falls_back_to_disk(tmp_path: Path) -> None:
+    ckpt = tmp_path / "best-03.ckpt"
+    ckpt.write_bytes(b"stub")
+    trainer = build_trainer(
+        tmp_path,
+        max_epochs=1,
+        monitor="valid_assignment_rate",
+        enable_progress_bar=False,
+    )
+    assert resolve_training_checkpoint(trainer, tmp_path) == ckpt
 
 
 def _sat_assignment_loader() -> DataLoader:

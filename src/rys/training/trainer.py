@@ -65,6 +65,25 @@ def best_checkpoint_path(trainer: L.Trainer) -> Path:
     raise RuntimeError("Trainer has no ModelCheckpoint with a saved path.")
 
 
+def resolve_training_checkpoint(trainer: L.Trainer, run_dir: Path) -> Path:
+    """Return the best available checkpoint after training or an interrupt.
+
+    Prefer the ModelCheckpoint callback paths; if those are empty (e.g. abrupt
+    interrupt), fall back to ``best-*.ckpt`` then ``last.ckpt`` under ``run_dir``.
+    """
+    try:
+        return best_checkpoint_path(trainer)
+    except RuntimeError:
+        pass
+    best_matches = sorted(run_dir.glob("best-*.ckpt"))
+    if best_matches:
+        return best_matches[-1]
+    last = run_dir / "last.ckpt"
+    if last.exists():
+        return last
+    raise RuntimeError(f"No checkpoint found in {run_dir}.")
+
+
 def load_rys_model(
     checkpoint_path: Path,
     build_model: Callable[[dict[str, Any] | None], torch.nn.Module],

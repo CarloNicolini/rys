@@ -40,7 +40,7 @@ from rys.sat_data import (
 _DEFAULT_RANDSAT_ROOT = Path("~/workspace/RandSATBench/datasets/3SAT").expanduser()
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
 from rys.training.modules import SatMPLitModule
-from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
+from rys.training.trainer import build_trainer, load_rys_model, resolve_training_checkpoint
 
 
 def main(
@@ -567,6 +567,7 @@ def train_one_depth(
     params = count_parameters(model)
     print(json.dumps({"depth": n_rounds, "n_params_total": params["total"], "n_params_trainable": params["trainable"]}))
 
+    training_interrupted = False
     checkpoint_path = depth_dir / "best.ckpt"
     if args.checkpoint is not None:
         # Inference-only: load existing weights and skip training so the RYS
@@ -594,8 +595,29 @@ def train_one_depth(
             mode=lit.primary_mode,
             extra_log_fields={"depth": n_rounds},
         )
-        trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
-        checkpoint_path = best_checkpoint_path(trainer)
+        try:
+            trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+        except KeyboardInterrupt:
+            training_interrupted = True
+            print(
+                json.dumps(
+                    {
+                        "depth": n_rounds,
+                        "training_interrupted": True,
+                        "message": "Training stopped; continuing with best checkpoint for evaluation and RYS.",
+                    }
+                )
+            )
+        try:
+            checkpoint_path = resolve_training_checkpoint(trainer, depth_dir)
+        except RuntimeError as exc:
+            if training_interrupted:
+                raise RuntimeError(
+                    f"Training interrupted at depth {n_rounds} before any checkpoint was saved in {depth_dir}."
+                ) from exc
+            raise
+        if training_interrupted:
+            print(json.dumps({"depth": n_rounds, "checkpoint": str(checkpoint_path)}))
 
     reloaded, _ = load_rys_model(
         checkpoint_path,
@@ -632,6 +654,7 @@ def train_one_depth(
             "config": config,
             "n_params": params,
             "checkpoint": str(checkpoint_path),
+            "training_interrupted": training_interrupted,
             "baselines": baselines,
             "best_rows": [],
             "n_rys_windows": 0,
@@ -661,6 +684,7 @@ def train_one_depth(
         "config": config,
         "n_params": params,
         "checkpoint": str(checkpoint_path),
+        "training_interrupted": training_interrupted,
         "baselines": baselines,
         "best_rows": best_rows,
         "n_rys_windows": len(strict_upper_windows(n_rounds)),
