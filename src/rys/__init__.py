@@ -28,12 +28,27 @@ from rys.coloring_data import (
 )
 from rys.coloring_message_passing import (
     ColoringBackbone,
-    ColoringMPConfig,
     ColoringMessagePassingModel,
+    ColoringMPConfig,
     ColoringRound,
 )
 from rys.data import csqa_prompts, gsm8k_prompts, mmlu_prompts
 from rys.modules import change_points, leiden_communities, plateau_metric
+from rys.nqueens_data import (
+    QueensDataset,
+    QueensExample,
+    board_is_valid,
+    make_queens_examples,
+    make_queens_splits,
+    soft_nqueens_loss,
+    verify_boards_tensor,
+)
+from rys.nqueens_message_passing import (
+    QueensBackbone,
+    QueensMessagePassingModel,
+    QueensMPConfig,
+    QueensRound,
+)
 from rys.plots import connectome_heatmap, delta_heatmap, panel
 from rys.residual_force import (
     amplification_long,
@@ -42,14 +57,17 @@ from rys.residual_force import (
     residual_force_matrices,
 )
 from rys.sat_data import (
+    ClauseAssignmentDataset,
+    NBucketBatchSampler,
     SatAssignmentDataset,
     SatAssignmentExample,
     SatDataset,
     SatExample,
     assignment_satisfies_formula,
+    collate_clause_assignment,
     encode_clause_tensor,
-    encode_formula_assignment_factorized,
     encode_formula,
+    encode_formula_assignment_factorized,
     encode_formula_factorized,
     factorized_assignment_sequence_length,
     factorized_sequence_length,
@@ -67,21 +85,6 @@ from rys.sat_message_passing import (
     MessagePassingRound,
     MessagePassingSatModel,
 )
-from rys.nqueens_data import (
-    QueensDataset,
-    QueensExample,
-    board_is_valid,
-    make_queens_examples,
-    make_queens_splits,
-    soft_nqueens_loss,
-    verify_boards_tensor,
-)
-from rys.nqueens_message_passing import (
-    QueensBackbone,
-    QueensMessagePassingModel,
-    QueensMPConfig,
-    QueensRound,
-)
 from rys.sorted_translation_data import (
     SortedExample,
     SortedTranslationDataset,
@@ -97,6 +100,7 @@ from rys.sorted_translation_transformer import (
     SortedTranslationTransformer,
 )
 from rys.surgery import apply_rys
+from rys.tensor_activations import capture_tensor_residual_stream
 from rys.theory_validation import (
     block_jacobian_sigma_max,
     junction_mismatch,
@@ -104,7 +108,6 @@ from rys.theory_validation import (
     rys_amplification_summary,
     theory_fit,
 )
-from rys.tensor_activations import capture_tensor_residual_stream
 from rys.tiny_transformer import (
     FactorizedAssignmentTransformerConfig,
     FactorizedCNFAssignmentTransformer,
@@ -116,6 +119,9 @@ from rys.tiny_transformer import (
 
 __all__ = [
     "FkPrior",
+    "ClauseAssignmentDataset",
+    "NBucketBatchSampler",
+    "collate_clause_assignment",
     "SatAssignmentDataset",
     "SatAssignmentExample",
     "SatDataset",

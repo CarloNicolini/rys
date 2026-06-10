@@ -30,19 +30,23 @@ from torch.utils.data import DataLoader
 from rys.cka import cka_matrix
 from rys.randsat_data import make_randsat_assignment_splits
 from rys.sat_data import (
-    SatAssignmentDataset,
+    ClauseAssignmentDataset,
+    NBucketBatchSampler,
+    collate_clause_assignment,
     make_sat_assignment_examples,
     make_sat_assignment_splits,
+    multisample_validity,
     soft_sat_loss,
     verify_assignment_tensor,
 )
-
-_DEFAULT_RANDSAT_ROOT = Path("~/workspace/RandSATBench/datasets/3SAT").expanduser()
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
-from rys.training.modules import SatMPLitModule
 from rys.training.device_cache import cache_batches_on_device
+from rys.training.modules import SatCoverageLitModule, SatMPLitModule
 from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import build_trainer, load_rys_model, resolve_training_checkpoint
+
+_DEFAULT_RANDSAT_ROOT = Path("~/workspace/RandSATBench/datasets/3SAT").expanduser()
+_TRAIN_REGIMES = ("deterministic", "best_of_k", "floor")
 
 
 def main(
@@ -104,8 +108,31 @@ def main(
     ),
     num_workers: int = typer.Option(4, help="DataLoader worker processes (RandSATBench only)."),
     pin_memory: bool = typer.Option(
-        True, "--pin-memory/--no-pin-memory", help="Pin host memory for CUDA (RandSATBench only)."
+        True, "--pin-memory/--no-pin-memory", help="Pin host memory (applied only on CUDA)."
     ),
+    bucket_by_n: bool = typer.Option(
+        True,
+        "--bucket-by-n/--no-bucket-by-n",
+        help="Group same-variable-count formulas into batches so clauses pad to the "
+        "per-batch maximum instead of the global one (tighter, faster).",
+    ),
+    cache_dir: Path | None = typer.Option(
+        None,
+        help="Directory for cached parsed RandSATBench examples (defaults to "
+        "<data_root>/.rys_cache). A warm cache skips the CSV read and CNF parsing.",
+    ),
+    train_regime: str = typer.Option(
+        "deterministic",
+        help="Training objective: 'deterministic' (deep-supervised soft-SAT), "
+        "'best_of_k', or 'floor'. The latter two enable the stochastic GRAM-style "
+        "solver and break the deterministic mode-collapse ceiling.",
+    ),
+    train_k: int = typer.Option(4, help="Sampled trajectories per formula for best_of_k/floor training."),
+    n_samples: int = typer.Option(20, help="N for valid@N / coverage reporting (stochastic regimes)."),
+    floor_sigma: float = typer.Option(0.7, help="Target std for the 'floor' regime."),
+    floor_reg: float = typer.Option(0.2, help="Variance-floor penalty weight (floor regime)."),
+    diversity_weight: float = typer.Option(0.1, help="Per-bit spread reward weight (stochastic regimes)."),
+    log_sigma_init: float = typer.Option(-1.0, help="Initial log-sigma for the stochastic solver."),
     output_dir: Path = typer.Option(Path("results/sat_messagepassing"), help="Run output directory."),
 ) -> None:
     args = argparse.Namespace(**locals())
@@ -170,29 +197,51 @@ def _resolve_data_root(args: argparse.Namespace) -> Path:
     return _DEFAULT_RANDSAT_ROOT
 
 
-def _build_dataloaders(
-    datasets: dict[str, SatAssignmentDataset],
+def _make_loader(
+    dataset: ClauseAssignmentDataset,
     args: argparse.Namespace,
     *,
+    shuffle: bool,
+    device: torch.device,
     randsat_mode: bool,
-) -> dict[str, DataLoader]:
-    loader_kwargs: dict = {}
+) -> DataLoader:
+    # ``pin_memory`` only helps the CUDA host->device copy; gate it on the device
+    # so a local MPS/CPU run does not warn or waste time pinning pages.
+    loader_kwargs: dict = {
+        "collate_fn": collate_clause_assignment,
+        "pin_memory": args.pin_memory and device.type == "cuda",
+    }
     if randsat_mode:
-        pin_memory = args.pin_memory and torch.cuda.is_available()
-        loader_kwargs = {"num_workers": args.num_workers, "pin_memory": pin_memory}
+        loader_kwargs["num_workers"] = args.num_workers
         if args.num_workers > 0:
             loader_kwargs["persistent_workers"] = True
+    if args.bucket_by_n:
+        sampler = NBucketBatchSampler(dataset.n_vars, args.batch_size, shuffle=shuffle, seed=args.seed)
+        return DataLoader(dataset, batch_sampler=sampler, **loader_kwargs)
+    return DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle, **loader_kwargs)
+
+
+def _build_dataloaders(
+    datasets: dict[str, ClauseAssignmentDataset],
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    randsat_mode: bool,
+) -> dict[str, DataLoader]:
     return {
-        "train": DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True, **loader_kwargs),
-        "val": DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
-        "test": DataLoader(datasets["test"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
-        "ood": DataLoader(datasets["ood"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
+        "train": _make_loader(datasets["train"], args, shuffle=True, device=device, randsat_mode=randsat_mode),
+        "val": _make_loader(datasets["val"], args, shuffle=False, device=device, randsat_mode=randsat_mode),
+        "test": _make_loader(datasets["test"], args, shuffle=False, device=device, randsat_mode=randsat_mode),
+        "ood": _make_loader(datasets["ood"], args, shuffle=False, device=device, randsat_mode=randsat_mode),
     }
 
 
-def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, int, pd.DataFrame | None]:
+def make_loaders(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[dict[str, DataLoader], int, int, pd.DataFrame | None]:
     if args.labels_csv is not None:
         data_root = _resolve_data_root(args)
+        cache_dir = args.cache_dir or (data_root / ".rys_cache")
         splits = make_randsat_assignment_splits(
             data_root,
             labels_csv=args.labels_csv,
@@ -203,15 +252,16 @@ def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, 
             max_indist=args.max_indist,
             max_ood=args.max_ood,
             seed=args.seed,
+            cache_dir=cache_dir,
         )
         quality = split_quality(splits)
         max_vars = max(ex.n_vars for split in splits.values() for ex in split)
         max_clauses = max(ex.n_clauses for split in splits.values() for ex in split)
         datasets = {
-            name: SatAssignmentDataset(examples, max_vars=max_vars, max_clauses=max_clauses)
+            name: ClauseAssignmentDataset(examples, max_vars=max_vars)
             for name, examples in splits.items()
         }
-        loaders = _build_dataloaders(datasets, args, randsat_mode=True)
+        loaders = _build_dataloaders(datasets, args, device=device, randsat_mode=True)
         return loaders, max_vars, max_clauses, quality
 
     max_vars = max(args.n_vars, args.ood_vars)
@@ -232,11 +282,15 @@ def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, 
         prefix="ood",
     )
     datasets = {
-        name: SatAssignmentDataset(examples, max_vars=max_vars, max_clauses=max_clauses)
+        name: ClauseAssignmentDataset(examples, max_vars=max_vars)
         for name, examples in splits.items()
     }
-    loaders = _build_dataloaders(datasets, args, randsat_mode=False)
+    loaders = _build_dataloaders(datasets, args, device=device, randsat_mode=False)
     return loaders, max_vars, max_clauses, None
+
+
+def is_stochastic_regime(train_regime: str) -> bool:
+    return train_regime in ("best_of_k", "floor")
 
 
 def build_model(args: argparse.Namespace, *, n_rounds: int, max_vars: int, max_clauses: int) -> tuple[MessagePassingSatModel, dict]:
@@ -247,6 +301,8 @@ def build_model(args: argparse.Namespace, *, n_rounds: int, max_vars: int, max_c
         n_rounds=n_rounds,
         d_mlp=args.d_mlp,
         dropout=args.dropout,
+        stochastic=is_stochastic_regime(args.train_regime),
+        log_sigma_init=args.log_sigma_init,
     )
     return MessagePassingSatModel(config), config.__dict__
 
@@ -258,10 +314,11 @@ def count_parameters(model: torch.nn.Module) -> dict[str, int]:
 
 
 def clause_tensors(batch: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    non_blocking = device.type == "cuda"
     return (
-        batch["clause_variable_ids"].to(device),
-        batch["clause_sign_ids"].to(device),
-        batch["clause_mask"].to(device),
+        batch["clause_variable_ids"].to(device, non_blocking=non_blocking),
+        batch["clause_sign_ids"].to(device, non_blocking=non_blocking),
+        batch["clause_mask"].to(device, non_blocking=non_blocking),
     )
 
 
@@ -366,9 +423,10 @@ def evaluate(
     model.eval()
     total_loss = 0.0
     counts = empty_counts()
+    non_blocking = device.type == "cuda"
     for batch in loader:
-        labels = batch["assignment_labels"].to(device)
-        mask = batch["assignment_mask"].to(device)
+        labels = batch["assignment_labels"].to(device, non_blocking=non_blocking)
+        mask = batch["assignment_mask"].to(device, non_blocking=non_blocking)
         cvi, csi, cm = clause_tensors(batch, device)
         if rys_window is None or n_repeats == 1:
             logits = model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm)["logits"]
@@ -401,8 +459,11 @@ def forward_logits_with_inclusive_rys(
     context = backbone.build_context(cvi, csi, cm)
     batch = cvi.shape[0]
     d = backbone.config.d_model
+    # Size the clause stream from the batch (per-batch padded width), matching
+    # ``MessagePassingBackbone.forward`` so dynamic-padded batches replay correctly.
+    n_clauses = cvi.shape[1]
     var_states = backbone.var_init.view(1, 1, d).expand(batch, backbone.config.max_vars, d)
-    clause_states = backbone.clause_init.view(1, 1, d).expand(batch, backbone.config.max_clauses, d)
+    clause_states = backbone.clause_init.view(1, 1, d).expand(batch, n_clauses, d)
     hidden = torch.cat([var_states, clause_states], dim=1).contiguous()
 
     for idx, layer in enumerate(layers):
@@ -426,9 +487,10 @@ def validity_vs_rounds(
 ) -> pd.DataFrame:
     model.eval()
     per_round = [empty_counts() for _ in range(n_rounds)]
+    non_blocking = device.type == "cuda"
     for batch in loader:
-        labels = batch["assignment_labels"].to(device)
-        mask = batch["assignment_mask"].to(device)
+        labels = batch["assignment_labels"].to(device, non_blocking=non_blocking)
+        mask = batch["assignment_mask"].to(device, non_blocking=non_blocking)
         cvi, csi, cm = clause_tensors(batch, device)
         outputs = model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm, return_round_logits=True)
         for round_idx, logits in enumerate(outputs["round_logits"]):
@@ -446,6 +508,42 @@ def validity_vs_rounds(
             }
         )
     return pd.DataFrame(rows)
+
+
+@torch.inference_mode()
+def multisample_metrics(
+    model: MessagePassingSatModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    n_samples: int,
+) -> dict[str, float]:
+    """valid@N and coverage from ``n_samples`` sampled trajectories per formula.
+
+    Only meaningful for the stochastic solver: each draw samples the GRAM-style
+    noise, so distinct draws can commit to different valid assignments and lift
+    validity above the deterministic single-sample ceiling.
+    """
+    model.eval()
+    non_blocking = device.type == "cuda"
+    valid_any = n_valid = coverage = total = 0
+    for batch in loader:
+        cvi, csi, cm = clause_tensors(batch, device)
+        amask = batch["assignment_mask"].to(device, non_blocking=non_blocking)
+        draws = [
+            model(clause_variable_ids=cvi, clause_sign_ids=csi, clause_mask=cm, sample=True)["logits"].argmax(dim=-1)
+            for _ in range(n_samples)
+        ]
+        out = multisample_validity(torch.stack(draws), cvi, csi, cm, assignment_mask=amask)
+        valid_any += int(out["valid_any"].sum())
+        n_valid += int(out["n_valid"].sum())
+        coverage += int(out["coverage"].sum())
+        total += int(cvi.shape[0])
+    return {
+        "valid_at_n": valid_any / total,
+        "mean_valid_fraction": n_valid / (total * n_samples),
+        "mean_coverage": coverage / total,
+    }
 
 
 @torch.inference_mode()
@@ -584,13 +682,29 @@ def train_one_depth(
         model.to(device)
         print(json.dumps({"depth": n_rounds, "loaded_checkpoint": str(args.checkpoint)}))
     else:
-        lit = SatMPLitModule(
-            model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            deep_supervision=args.deep_supervision,
-            model_config=config,
-        )
+        if is_stochastic_regime(args.train_regime):
+            # Winner-take-all (best_of_k) or variance-floor training of the
+            # stochastic solver; the deterministic F+mu path still carries the
+            # RYS sweep below, so depth (RYS) and width (sampling) stay separable.
+            lit = SatCoverageLitModule(
+                model,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                regime=args.train_regime,
+                train_k=args.train_k,
+                floor_sigma=args.floor_sigma,
+                floor_reg=args.floor_reg,
+                diversity_weight=args.diversity_weight,
+                model_config=config,
+            )
+        else:
+            lit = SatMPLitModule(
+                model,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                deep_supervision=args.deep_supervision,
+                model_config=config,
+            )
         trainer = build_trainer(
             depth_dir,
             max_epochs=args.epochs,
@@ -637,7 +751,16 @@ def train_one_depth(
         frame.to_csv(depth_dir / f"validity_vs_rounds_{split}.csv", index=False)
     save_round_curve(curves, depth_dir / "validity_vs_rounds.png", depth=n_rounds)
 
-    activations = capture_variable_states(reloaded, loaders["val"], device, max_batches=args.capture_batches)
+    # Capture from a plain (non-bucketed) loader so the connectome sees the
+    # natural mix of variable counts; bucketed batches would feed the CKA only
+    # the smallest-N instances of the first few batches.
+    capture_loader = DataLoader(
+        loaders["val"].dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_clause_assignment,
+    )
+    activations = capture_variable_states(reloaded, capture_loader, device, max_batches=args.capture_batches)
     activations.to_pickle(depth_dir / "variable_activations.pkl")
     cka = cka_matrix(activations, unbiased=False, device="cpu")
     cka.to_csv(depth_dir / "cka_variable_val.csv")
@@ -651,6 +774,13 @@ def train_one_depth(
     )
 
     baselines = {split: evaluate(reloaded, loaders[split], device) for split in ("val", "test", "ood")}
+    multisample = {}
+    if is_stochastic_regime(args.train_regime):
+        multisample = {
+            split: multisample_metrics(reloaded, loaders[split], device, n_samples=args.n_samples)
+            for split in ("val", "test", "ood")
+        }
+        print(json.dumps({"depth": n_rounds, "train_regime": args.train_regime, "multisample": multisample}))
     if args.skip_rys:
         summary = {
             "depth": n_rounds,
@@ -658,7 +788,9 @@ def train_one_depth(
             "n_params": params,
             "checkpoint": str(checkpoint_path),
             "training_interrupted": training_interrupted,
+            "train_regime": args.train_regime,
             "baselines": baselines,
+            "multisample": multisample,
             "best_rows": [],
             "n_rys_windows": 0,
             "rys_skipped": True,
@@ -688,7 +820,9 @@ def train_one_depth(
         "n_params": params,
         "checkpoint": str(checkpoint_path),
         "training_interrupted": training_interrupted,
+        "train_regime": args.train_regime,
         "baselines": baselines,
+        "multisample": multisample,
         "best_rows": best_rows,
         "n_rys_windows": len(strict_upper_windows(n_rounds)),
         "rys_skipped": False,
@@ -751,17 +885,39 @@ def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace)
             f"{baselines['ood']['valid_assignment_rate']:.3f} | "
             f"{_window('val')} | {_window('test')} | {_window('ood')} |"
         )
+
+    if any(summary.get("multisample") for summary in summaries):
+        lines += [
+            "",
+            f"## Stochastic width (regime `{args.train_regime}`, K={args.train_k}, N={args.n_samples})",
+            "",
+            "| depth | split | single-sample | valid@N | coverage |",
+            "| ---: | --- | ---: | ---: | ---: |",
+        ]
+        for summary in summaries:
+            multisample = summary.get("multisample") or {}
+            for split in ("val", "test", "ood"):
+                if split in multisample:
+                    lines.append(
+                        f"| {summary['depth']} | {split} | "
+                        f"{summary['baselines'][split]['valid_assignment_rate']:.3f} | "
+                        f"{multisample[split]['valid_at_n']:.3f} | "
+                        f"{multisample[split]['mean_coverage']:.2f} |"
+                    )
+
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
 def _run(args: argparse.Namespace) -> None:
     L.seed_everything(args.seed, workers=True)
     device = resolve_device()
+    if args.train_regime not in _TRAIN_REGIMES:
+        raise ValueError(f"train_regime must be one of {_TRAIN_REGIMES}; got {args.train_regime!r}.")
     depths = parse_depths(args.depths)
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    loaders, max_vars, max_clauses, quality = make_loaders(args)
+    loaders, max_vars, max_clauses, quality = make_loaders(args, device)
     if quality is not None:
         quality.to_csv(run_dir / "dataset_quality.csv", index=False)
     summaries = []

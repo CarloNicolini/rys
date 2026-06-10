@@ -7,12 +7,12 @@ are encoded as short token sequences suitable for a tiny Transformer classifier.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 PAD = 0
 CLS = 1
@@ -691,3 +691,153 @@ class SatAssignmentDataset(Dataset):
             )
         )
         return item
+
+
+class ClauseAssignmentDataset(Dataset):
+    """Lean assignment dataset for the clause-variable message-passing solver.
+
+    Two differences from :class:`SatAssignmentDataset` make it cheap for large
+    RandSATBench runs:
+
+    - It encodes every example *once* in ``__init__`` instead of on every
+      ``__getitem__``, and it produces only the tensors the message-passing model
+      consumes (the clause adjacency plus the assignment labels/mask), dropping
+      the flat- and factorized-token fields that solver never reads.
+    - Clause tensors are stored *unpadded* (length ``n_clauses``).  Pair the
+      dataset with :func:`collate_clause_assignment` to pad each batch to its own
+      clause maximum rather than the global one.  Variable-side tensors keep the
+      global ``max_vars`` width because the model's variable stream and the
+      assignment head are that wide.
+    """
+
+    def __init__(self, examples: Sequence[SatAssignmentExample], *, max_vars: int | None = None) -> None:
+        if not examples:
+            raise ValueError("ClauseAssignmentDataset requires at least one example.")
+        self.examples = list(examples)
+        self.max_vars = max_vars or max(ex.n_vars for ex in self.examples)
+        self.n_vars = [ex.n_vars for ex in self.examples]
+        self._items = [self._encode(ex) for ex in self.examples]
+
+    def _encode(self, ex: SatAssignmentExample) -> dict[str, torch.Tensor | str]:
+        if ex.n_vars > self.max_vars:
+            raise ValueError(f"Example has n_vars={ex.n_vars} > max_vars={self.max_vars}.")
+        labels = torch.full((self.max_vars,), -100, dtype=torch.long)
+        mask = torch.zeros(self.max_vars, dtype=torch.bool)
+        labels[: ex.n_vars] = torch.tensor(ex.assignment, dtype=torch.long)
+        mask[: ex.n_vars] = True
+        clause = encode_clause_tensor(ex.formula, n_vars=ex.n_vars, max_clauses=len(ex.formula))
+        return {
+            "assignment_labels": labels,
+            "assignment_mask": mask,
+            "labels": labels,
+            "prompt_id": ex.prompt_id,
+            **clause,
+        }
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
+        return self._items[idx]
+
+
+def collate_clause_assignment(samples: Sequence[dict[str, torch.Tensor | str]]) -> dict[str, torch.Tensor | list[str]]:
+    """Collate :class:`ClauseAssignmentDataset` items, padding clauses per batch.
+
+    Each clause tensor is padded to the batch's clause maximum (padded clauses
+    are fully masked, so the result is numerically identical to global padding).
+    Variable-side tensors already share ``max_vars`` and are simply stacked.
+    """
+    if not samples:
+        raise ValueError("collate_clause_assignment received an empty batch.")
+    batch = len(samples)
+    max_clauses = max(int(sample["clause_mask"].shape[0]) for sample in samples)
+    clause_variable_ids = torch.zeros(batch, max_clauses, 3, dtype=torch.long)
+    clause_sign_ids = torch.zeros(batch, max_clauses, 3, dtype=torch.long)
+    clause_mask = torch.zeros(batch, max_clauses, dtype=torch.bool)
+    for row, sample in enumerate(samples):
+        n_clauses = int(sample["clause_mask"].shape[0])
+        clause_variable_ids[row, :n_clauses] = sample["clause_variable_ids"]
+        clause_sign_ids[row, :n_clauses] = sample["clause_sign_ids"]
+        clause_mask[row, :n_clauses] = sample["clause_mask"]
+    labels = torch.stack([sample["assignment_labels"] for sample in samples])
+    assignment_mask = torch.stack([sample["assignment_mask"] for sample in samples])
+    return {
+        "clause_variable_ids": clause_variable_ids,
+        "clause_sign_ids": clause_sign_ids,
+        "clause_mask": clause_mask,
+        "assignment_labels": labels,
+        "assignment_mask": assignment_mask,
+        "labels": labels,
+        "prompt_id": [str(sample["prompt_id"]) for sample in samples],
+    }
+
+
+class NBucketBatchSampler(Sampler[list[int]]):
+    """Batch indices that share a size key (e.g. variable count) together.
+
+    Grouping same-sized instances keeps the per-batch clause padding tight when
+    paired with :func:`collate_clause_assignment`.  With ``shuffle`` the order of
+    examples within each bucket and the order of the emitted batches are permuted
+    every epoch.  Each bucket emits its own trailing short batch unless
+    ``drop_last`` is set.
+    """
+
+    def __init__(
+        self,
+        group_ids: Iterable[int],
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 0,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive.")
+        self.group_ids = list(group_ids)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def _buckets(self) -> dict[int, list[int]]:
+        buckets: dict[int, list[int]] = {}
+        for idx, group in enumerate(self.group_ids):
+            buckets.setdefault(int(group), []).append(idx)
+        return buckets
+
+    def _make_batches(self) -> list[list[int]]:
+        buckets = self._buckets()
+        rng = np.random.default_rng(self.seed + self._epoch) if self.shuffle else None
+        batches: list[list[int]] = []
+        for group in sorted(buckets):
+            members = buckets[group]
+            if rng is not None:
+                members = [members[i] for i in rng.permutation(len(members))]
+            for start in range(0, len(members), self.batch_size):
+                batch = members[start : start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                batches.append(batch)
+        if rng is not None:
+            batches = [batches[i] for i in rng.permutation(len(batches))]
+        return batches
+
+    def __iter__(self):
+        batches = self._make_batches()
+        self._epoch += 1
+        return iter(batches)
+
+    def __len__(self) -> int:
+        total = 0
+        for members in self._buckets().values():
+            count = len(members)
+            if self.drop_last:
+                total += count // self.batch_size
+            else:
+                total += (count + self.batch_size - 1) // self.batch_size
+        return total

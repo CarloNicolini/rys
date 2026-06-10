@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
 from rys.sat_data import (
+    ClauseAssignmentDataset,
+    NBucketBatchSampler,
     SatAssignmentDataset,
+    collate_clause_assignment,
     make_sat_assignment_examples,
     multisample_validity,
     soft_sat_loss,
     verify_assignment_tensor,
 )
-import pandas as pd
-
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
 from rys.surgery import apply_rys
 from rys.theory_validation import junction_mismatch, rho_phi_table, theory_fit
+from rys.training.modules import SatCoverageLitModule
 
 
 def _loader() -> DataLoader:
@@ -195,3 +198,91 @@ def test_rho_phi_pipeline_runs() -> None:
     fit = theory_fit(table)
     assert fit["n_pairs_total"] == len(table)
     assert junction_mismatch(activations, window=(0, 2)) >= 0.0
+
+
+def test_clause_assignment_dataset_is_lean_and_unpadded() -> None:
+    examples = make_sat_assignment_examples(3, n_vars=4, n_clauses=9, seed=0)
+    dataset = ClauseAssignmentDataset(examples, max_vars=5)
+    item = dataset[0]
+    assert set(item) == {
+        "assignment_labels",
+        "assignment_mask",
+        "labels",
+        "prompt_id",
+        "clause_variable_ids",
+        "clause_sign_ids",
+        "clause_mask",
+    }
+    # Clauses are stored unpadded; variable-side tensors keep the global width.
+    assert item["clause_variable_ids"].shape == (9, 3)
+    assert item["assignment_labels"].shape == (5,)
+    assert dataset.n_vars == [4, 4, 4]
+
+
+def test_dynamic_clause_padding_matches_global_padding() -> None:
+    # Padding clauses to the per-batch maximum must be numerically identical to
+    # the old global padding, because padded clauses are fully masked.
+    examples = make_sat_assignment_examples(6, n_vars=4, n_clauses=10, seed=3)
+    model = _model()
+
+    global_batch = next(iter(DataLoader(SatAssignmentDataset(examples, max_vars=5, max_clauses=18), batch_size=6)))
+    lean_batch = next(
+        iter(
+            DataLoader(
+                ClauseAssignmentDataset(examples, max_vars=5),
+                batch_size=6,
+                shuffle=False,
+                collate_fn=collate_clause_assignment,
+            )
+        )
+    )
+    assert global_batch["clause_variable_ids"].shape[1] == 18
+    assert lean_batch["clause_variable_ids"].shape[1] == 10
+
+    with torch.inference_mode():
+        global_logits = model(**_kwargs(global_batch))["logits"]
+        lean_logits = model(**_kwargs(lean_batch))["logits"]
+    torch.testing.assert_close(global_logits, lean_logits)
+    torch.testing.assert_close(global_batch["assignment_labels"], lean_batch["assignment_labels"])
+    torch.testing.assert_close(global_batch["assignment_mask"], lean_batch["assignment_mask"])
+
+
+def test_nbucket_sampler_groups_by_size_and_covers_all() -> None:
+    group_ids = [16, 32, 16, 16, 32, 64]
+    sampler = NBucketBatchSampler(group_ids, batch_size=2, shuffle=False)
+    batches = list(sampler)
+    for batch in batches:
+        assert len({group_ids[i] for i in batch}) == 1  # homogeneous in size
+    flat = sorted(idx for batch in batches for idx in batch)
+    assert flat == list(range(len(group_ids)))
+    assert len(sampler) == len(batches)
+
+
+def test_nbucket_sampler_shuffle_still_covers_all_once() -> None:
+    group_ids = [16] * 5 + [32] * 3
+    sampler = NBucketBatchSampler(group_ids, batch_size=2, shuffle=True, seed=1)
+    first = sorted(idx for batch in sampler for idx in batch)
+    second = sorted(idx for batch in sampler for idx in batch)  # reshuffles, still a partition
+    assert first == list(range(8))
+    assert second == list(range(8))
+    for batch in sampler:
+        assert len({group_ids[i] for i in batch}) == 1
+
+
+def test_best_of_k_training_step_runs() -> None:
+    model = _stochastic_model()
+    batch = next(iter(_loader()))
+    lit = SatCoverageLitModule(
+        model,
+        lr=1e-3,
+        weight_decay=0.0,
+        regime="best_of_k",
+        train_k=3,
+        floor_sigma=0.7,
+        floor_reg=0.2,
+        diversity_weight=0.1,
+        model_config=model.config.__dict__,
+    )
+    loss, metrics = lit._shared_step(batch, "train")
+    assert torch.isfinite(loss)
+    assert "valid_assignment_rate" in metrics

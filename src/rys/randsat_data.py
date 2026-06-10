@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import pickle
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +79,74 @@ def _resolve_cnf_path(data_root: Path, cnf_file: str) -> Path:
     raise FileNotFoundError(f"Could not find CNF file for {cnf_file!r} under {data_root}.")
 
 
+def _read_labels_frame(labels_csv: Path) -> pd.DataFrame:
+    """Read the labels CSV once, keep satisfiable rows, and parse N/M vectorised."""
+    frame = pd.read_csv(labels_csv)
+    frame = frame[frame["sat"] == 1].copy()
+    frame = frame[frame["assignment"].astype(str).str.strip().ne("")]
+    if frame.empty:
+        raise ValueError(f"No satisfiable rows with assignments found in {labels_csv}.")
+
+    extracted = frame["cnf_file"].astype(str).str.extract(_FILENAME_RE)
+    if extracted.isna().to_numpy().any():
+        bad = frame["cnf_file"][extracted.isna().any(axis=1)].iloc[0]
+        raise ValueError(f"Could not parse N/M from {bad!r}.")
+    frame["n_vars"] = extracted[0].astype(int)
+    frame["n_clauses"] = extracted[1].astype(int)
+    return frame
+
+
+def _cache_path(
+    cache_dir: Path,
+    data_root: Path,
+    labels_csv: Path,
+    var_values: set[int] | frozenset[int],
+    max_examples: int | None,
+    seed: int,
+) -> Path:
+    """Return the cache file for one parsed example set, keyed by its inputs."""
+    labels_csv = Path(labels_csv)
+    try:
+        stat = labels_csv.stat()
+        signature = f"{stat.st_size}:{int(stat.st_mtime)}"
+    except OSError:
+        signature = "nostat"
+    key = "|".join(
+        [
+            str(Path(data_root).resolve()),
+            str(labels_csv.resolve()),
+            signature,
+            ",".join(str(value) for value in sorted(var_values)),
+            str(max_examples),
+            str(seed),
+        ]
+    )
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return Path(cache_dir) / f"randsat_examples_{digest}.pkl"
+
+
+def _load_cached_examples(path: Path) -> list[SatAssignmentExample] | None:
+    """Return cached examples, or ``None`` if the cache is missing or unreadable."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as handle:
+            payload = pickle.load(handle)
+        return list(payload["examples"])
+    except (OSError, pickle.UnpicklingError, EOFError, KeyError, AttributeError):
+        return None
+
+
+def _save_cached_examples(path: Path, examples: list[SatAssignmentExample]) -> None:
+    """Best-effort write of parsed examples; never raise into the caller."""
+    with contextlib.suppress(OSError, pickle.PicklingError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as handle:
+            pickle.dump({"examples": examples}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)
+
+
 def load_randsat_assignment_examples(
     data_root: Path,
     labels_csv: Path,
@@ -82,32 +154,44 @@ def load_randsat_assignment_examples(
     var_values: set[int] | frozenset[int],
     max_examples: int | None = None,
     seed: int = 0,
+    frame: pd.DataFrame | None = None,
+    frame_loader: Callable[[], pd.DataFrame] | None = None,
+    cache_dir: Path | None = None,
 ) -> list[SatAssignmentExample]:
-    """Load satisfiable RandSATBench examples with canonical assignments."""
+    """Load satisfiable RandSATBench examples with canonical assignments.
+
+    Parsing every CNF file is the dominant startup cost on large splits, so when
+    ``cache_dir`` is given the parsed example list is cached on disk keyed by the
+    labels-file signature, ``var_values``, ``max_examples``, and ``seed``; a cache
+    hit skips both the CSV read and the per-file DIMACS parse.  A preloaded
+    ``frame`` (or a lazy ``frame_loader``) lets callers share a single CSV read
+    across several queries.
+    """
     if not var_values:
         raise ValueError("var_values must be non-empty.")
 
-    frame = pd.read_csv(labels_csv)
-    frame = frame[frame["sat"] == 1].copy()
-    frame = frame[frame["assignment"].astype(str).str.strip().ne("")]
-    if frame.empty:
-        raise ValueError(f"No satisfiable rows with assignments found in {labels_csv}.")
+    cache_file = None
+    if cache_dir is not None:
+        cache_file = _cache_path(cache_dir, data_root, labels_csv, var_values, max_examples, seed)
+        cached = _load_cached_examples(cache_file)
+        if cached is not None:
+            return cached
 
-    frame[["n_vars", "n_clauses"]] = frame["cnf_file"].apply(
-        lambda name: pd.Series(parse_n_vars_clauses(name))
-    )
-    frame = frame[frame["n_vars"].isin(var_values)]
-    if frame.empty:
+    if frame is None:
+        frame = frame_loader() if frame_loader is not None else _read_labels_frame(labels_csv)
+
+    subset = frame[frame["n_vars"].isin(set(var_values))]
+    if subset.empty:
         raise ValueError(f"No rows matched var_values={sorted(var_values)} in {labels_csv}.")
 
-    frame = frame.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    subset = subset.sample(frac=1.0, random_state=seed).reset_index(drop=True)
     if max_examples is not None:
         if max_examples < 1:
             raise ValueError("max_examples must be positive when provided.")
-        frame = frame.iloc[:max_examples]
+        subset = subset.iloc[:max_examples]
 
     examples: list[SatAssignmentExample] = []
-    for row in frame.itertuples(index=False):
+    for row in subset.itertuples(index=False):
         cnf_file = str(row.cnf_file)
         n_vars = int(row.n_vars)
         n_clauses = int(row.n_clauses)
@@ -128,6 +212,8 @@ def load_randsat_assignment_examples(
                 prompt_id=cnf_file,
             )
         )
+    if cache_file is not None:
+        _save_cached_examples(cache_file, examples)
     return examples
 
 
@@ -142,18 +228,34 @@ def make_randsat_assignment_splits(
     max_indist: int | None = None,
     max_ood: int | None = None,
     seed: int = 0,
+    cache_dir: Path | None = None,
 ) -> dict[str, list[SatAssignmentExample]]:
-    """Build train/val/test/ood splits from RandSATBench train labels."""
+    """Build train/val/test/ood splits from RandSATBench train labels.
+
+    The in-distribution and OOD example queries share a single lazy CSV read, and
+    each is cached on disk when ``cache_dir`` is set, so a warm cache builds the
+    splits without touching the labels file or the CNF directory.
+    """
     if val_frac < 0 or test_frac < 0 or val_frac + test_frac >= 1:
         raise ValueError("val_frac and test_frac must be non-negative and sum to less than 1.")
 
     labels_path = labels_csv or (data_root / "train_labels.csv")
+
+    frame_box: list[pd.DataFrame] = []
+
+    def shared_frame() -> pd.DataFrame:
+        if not frame_box:
+            frame_box.append(_read_labels_frame(labels_path))
+        return frame_box[0]
+
     indist = load_randsat_assignment_examples(
         data_root,
         labels_path,
         var_values=set(indist_vars),
         max_examples=max_indist,
         seed=seed,
+        frame_loader=shared_frame,
+        cache_dir=cache_dir,
     )
     if len(indist) < 3:
         raise ValueError("Need at least three in-distribution examples to split train/val/test.")
@@ -179,6 +281,8 @@ def make_randsat_assignment_splits(
         var_values=set(ood_vars),
         max_examples=max_ood,
         seed=seed + 1,
+        frame_loader=shared_frame,
+        cache_dir=cache_dir,
     )
     if not ood:
         raise ValueError(f"No OOD examples found for ood_vars={ood_vars}.")

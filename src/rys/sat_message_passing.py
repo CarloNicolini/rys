@@ -226,7 +226,14 @@ class MessagePassingBackbone(nn.Module):
             var_states = self.var_id_embed(ids).unsqueeze(0).expand(batch, self.config.max_vars, d)
         else:
             var_states = self.var_init.view(1, 1, d).expand(batch, self.config.max_vars, d)
-        clause_states = self.clause_init.view(1, 1, d).expand(batch, self.config.max_clauses, d)
+        # The clause stream is sized from the input, not from ``config.max_clauses``.
+        # Every clause-side weight (literal/clause/message modules) is shared across
+        # clauses, so the only thing that ever needed the configured maximum was this
+        # initial buffer.  Reading the count from the batch lets a loader pad clauses
+        # to the per-batch maximum instead of the global one with identical math
+        # (padded clauses are fully masked), which removes the dominant wasted compute.
+        n_clauses = clause_variable_ids.shape[1]
+        clause_states = self.clause_init.view(1, 1, d).expand(batch, n_clauses, d)
         hidden = torch.cat([var_states, clause_states], dim=1).contiguous()
 
         context = self.build_context(clause_variable_ids, clause_sign_ids, clause_mask)
