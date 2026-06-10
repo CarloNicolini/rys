@@ -6,6 +6,10 @@ canonical one.  For each trained depth the script records:
 - a validity-vs-rounds curve (assignment quality read out after each round);
 - the validation CKA connectome over variable states;
 - strict upper-triangular RYS Delta matrices (validity, bit, exact).
+
+By default, formulas are sampled synthetically.  Pass ``--labels-csv`` to train on
+real RandSATBench 3-SAT instances (CaDiCaL labels); CNF files are resolved under
+``--data-root`` (defaults to the labels file's parent directory).
 """
 
 from __future__ import annotations
@@ -15,13 +19,16 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
+from rys.randsat_data import make_randsat_assignment_splits
 from rys.sat_data import (
     SatAssignmentDataset,
     make_sat_assignment_examples,
@@ -29,40 +36,78 @@ from rys.sat_data import (
     soft_sat_loss,
     verify_assignment_tensor,
 )
+
+_DEFAULT_RANDSAT_ROOT = Path("~/workspace/RandSATBench/datasets/3SAT").expanduser()
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
+from rys.training.modules import SatMPLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=43)
-    parser.add_argument("--depths", type=str, default="8,16,32")
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=24)
-    parser.add_argument("--ood-vars", type=int, default=8)
-    parser.add_argument("--ood-clauses", type=int, default=34)
-    parser.add_argument("--n-train", type=int, default=4096)
-    parser.add_argument("--n-val", type=int, default=1024)
-    parser.add_argument("--n-test", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--max-repeat", type=int, default=2)
-    parser.add_argument("--capture-batches", type=int, default=4)
-    parser.add_argument("--deep-supervision", action="store_true", default=True)
-    parser.add_argument("--no-deep-supervision", dest="deep_supervision", action="store_false")
-    parser.add_argument("--skip-rys", action="store_true", help="Train and export curves/CKA without RYS matrices.")
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=None,
-        help="Load these weights and skip training (single --depths value). Lets you re-run the RYS sweep with a different --max-repeat without retraining.",
-    )
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_messagepassing"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(43, help="Random seed."),
+    depths: str = typer.Option("8,16,32", help="Comma-separated message-passing depths (rounds) to sweep."),
+    n_vars: int = typer.Option(6, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(24, help="In-distribution clause count."),
+    ood_vars: int = typer.Option(8, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(34, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(4096, help="Training examples."),
+    n_val: int = typer.Option(1024, help="Validation examples."),
+    n_test: int = typer.Option(1024, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(20, help="Training epochs."),
+    lr: float = typer.Option(5e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    dropout: float = typer.Option(0.0, help="Dropout probability."),
+    max_repeat: int = typer.Option(2, help="Total traversals of each RYS window."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the CKA connectome."),
+    deep_supervision: bool = typer.Option(
+        True, "--deep-supervision/--no-deep-supervision", help="Average the soft-SAT loss over every round."
+    ),
+    skip_rys: bool = typer.Option(
+        False, "--skip-rys/--no-skip-rys", help="Train and export curves/CKA without RYS matrices."
+    ),
+    checkpoint: Path | None = typer.Option(
+        None,
+        help="Load these weights and skip training (single --depths value). "
+        "Lets you re-run the RYS sweep with a different --max-repeat without retraining.",
+    ),
+    labels_csv: Path | None = typer.Option(
+        None,
+        help="RandSATBench labels CSV (e.g. train_labels.csv). When set, load real 3-SAT "
+        "instances instead of synthetic formulas.",
+    ),
+    data_root: Path | None = typer.Option(
+        None,
+        help="RandSATBench dataset root for CNF resolution (defaults to labels CSV parent).",
+    ),
+    indist_vars: str = typer.Option(
+        "16,32",
+        help="Variable counts N for the in-distribution pool (RandSATBench mode only).",
+    ),
+    randsat_ood_vars: str = typer.Option(
+        "64",
+        help="Variable counts N for the OOD split (RandSATBench mode only).",
+    ),
+    val_frac: float = typer.Option(0.1, help="Validation fraction of the in-dist pool (RandSATBench only)."),
+    test_frac: float = typer.Option(0.1, help="Test fraction of the in-dist pool (RandSATBench only)."),
+    max_indist: int | None = typer.Option(
+        None,
+        help="Cap on in-distribution examples, not variables (RandSATBench only).",
+    ),
+    max_ood: int | None = typer.Option(
+        None,
+        help="Cap on OOD examples, not variables (RandSATBench only).",
+    ),
+    num_workers: int = typer.Option(4, help="DataLoader worker processes (RandSATBench only)."),
+    pin_memory: bool = typer.Option(
+        True, "--pin-memory/--no-pin-memory", help="Pin host memory for CUDA (RandSATBench only)."
+    ),
+    output_dir: Path = typer.Option(Path("results/sat_messagepassing"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -87,7 +132,86 @@ def parse_depths(value: str) -> list[int]:
     return depths
 
 
-def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, int]:
+def parse_int_list(value: str) -> tuple[int, ...]:
+    values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not values:
+        raise ValueError(f"Expected at least one integer in {value!r}.")
+    return values
+
+
+def split_quality(splits: dict[str, list]) -> pd.DataFrame:
+    rows = []
+    for split, examples in splits.items():
+        if not examples:
+            raise ValueError(f"Split {split!r} is empty.")
+        n_vars_values = sorted({ex.n_vars for ex in examples})
+        n_clauses_values = [ex.n_clauses for ex in examples]
+        assignments = [value for ex in examples for value in ex.assignment]
+        rows.append(
+            {
+                "split": split,
+                "n_total": len(examples),
+                "n_vars_values": ",".join(str(v) for v in n_vars_values),
+                "n_clauses_min": min(n_clauses_values),
+                "n_clauses_max": max(n_clauses_values),
+                "assignment_one_rate": float(sum(assignments) / len(assignments)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _resolve_data_root(args: argparse.Namespace) -> Path:
+    if args.data_root is not None:
+        return args.data_root
+    if args.labels_csv is not None:
+        return args.labels_csv.parent
+    return _DEFAULT_RANDSAT_ROOT
+
+
+def _build_dataloaders(
+    datasets: dict[str, SatAssignmentDataset],
+    args: argparse.Namespace,
+    *,
+    randsat_mode: bool,
+) -> dict[str, DataLoader]:
+    loader_kwargs: dict = {}
+    if randsat_mode:
+        pin_memory = args.pin_memory and torch.cuda.is_available()
+        loader_kwargs = {"num_workers": args.num_workers, "pin_memory": pin_memory}
+        if args.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+    return {
+        "train": DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True, **loader_kwargs),
+        "val": DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
+        "test": DataLoader(datasets["test"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
+        "ood": DataLoader(datasets["ood"], batch_size=args.batch_size, shuffle=False, **loader_kwargs),
+    }
+
+
+def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, int, pd.DataFrame | None]:
+    if args.labels_csv is not None:
+        data_root = _resolve_data_root(args)
+        splits = make_randsat_assignment_splits(
+            data_root,
+            labels_csv=args.labels_csv,
+            indist_vars=parse_int_list(args.indist_vars),
+            ood_vars=parse_int_list(args.randsat_ood_vars),
+            val_frac=args.val_frac,
+            test_frac=args.test_frac,
+            max_indist=args.max_indist,
+            max_ood=args.max_ood,
+            seed=args.seed,
+        )
+        quality = split_quality(splits)
+        max_vars = max(ex.n_vars for split in splits.values() for ex in split)
+        max_clauses = max(ex.n_clauses for split in splits.values() for ex in split)
+        datasets = {
+            name: SatAssignmentDataset(examples, max_vars=max_vars, max_clauses=max_clauses)
+            for name, examples in splits.items()
+        }
+        loaders = _build_dataloaders(datasets, args, randsat_mode=True)
+        return loaders, max_vars, max_clauses, quality
+
     max_vars = max(args.n_vars, args.ood_vars)
     max_clauses = max(args.n_clauses, args.ood_clauses)
     splits = make_sat_assignment_splits(
@@ -109,13 +233,8 @@ def make_loaders(args: argparse.Namespace) -> tuple[dict[str, DataLoader], int, 
         name: SatAssignmentDataset(examples, max_vars=max_vars, max_clauses=max_clauses)
         for name, examples in splits.items()
     }
-    loaders = {
-        "train": DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True),
-        "val": DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False),
-        "test": DataLoader(datasets["test"], batch_size=args.batch_size, shuffle=False),
-        "ood": DataLoader(datasets["ood"], batch_size=args.batch_size, shuffle=False),
-    }
-    return loaders, max_vars, max_clauses
+    loaders = _build_dataloaders(datasets, args, randsat_mode=False)
+    return loaders, max_vars, max_clauses, None
 
 
 def build_model(args: argparse.Namespace, *, n_rounds: int, max_vars: int, max_clauses: int) -> tuple[MessagePassingSatModel, dict]:
@@ -448,33 +567,41 @@ def train_one_depth(
     params = count_parameters(model)
     print(json.dumps({"depth": n_rounds, "n_params_total": params["total"], "n_params_trainable": params["trainable"]}))
 
-    checkpoint_path = depth_dir / "checkpoint.pt"
+    checkpoint_path = depth_dir / "best.ckpt"
     if args.checkpoint is not None:
         # Inference-only: load existing weights and skip training so the RYS
         # sweep can be re-run with a different --max-repeat at no training cost.
-        payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(payload["model_state_dict"])
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+        model, _ = load_rys_model(
+            args.checkpoint,
+            lambda _config: build_model(args, n_rounds=n_rounds, max_vars=max_vars, max_clauses=max_clauses)[0],
+            map_location=device,
+        )
+        checkpoint_path = args.checkpoint
+        model.to(device)
         print(json.dumps({"depth": n_rounds, "loaded_checkpoint": str(args.checkpoint)}))
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        history = []
-        for epoch in range(1, args.epochs + 1):
-            train_metrics = train_epoch(model, loaders["train"], optimizer, device, deep_supervision=args.deep_supervision)
-            val_metrics = evaluate(model, loaders["val"], device)
-            row = {
-                "epoch": epoch,
-                **{f"train_{key}": value for key, value in train_metrics.items()},
-                **{f"val_{key}": value for key, value in val_metrics.items()},
-            }
-            history.append(row)
-            print(json.dumps({"depth": n_rounds, **row}))
-        pd.DataFrame(history).to_csv(depth_dir / "train_history.csv", index=False)
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+        lit = SatMPLitModule(
+            model,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            deep_supervision=args.deep_supervision,
+            model_config=config,
+        )
+        trainer = build_trainer(
+            depth_dir,
+            max_epochs=args.epochs,
+            monitor=lit.primary_metric,
+            mode=lit.primary_mode,
+            extra_log_fields={"depth": n_rounds},
+        )
+        trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+        checkpoint_path = best_checkpoint_path(trainer)
 
-    reloaded, _ = build_model(args, n_rounds=n_rounds, max_vars=max_vars, max_clauses=max_clauses)
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    reloaded.load_state_dict(payload["model_state_dict"])
+    reloaded, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: build_model(args, n_rounds=n_rounds, max_vars=max_vars, max_clauses=max_clauses)[0],
+        map_location=device,
+    )
     reloaded.to(device)
 
     curves = {
@@ -544,29 +671,50 @@ def train_one_depth(
 
 
 def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace) -> None:
-    lines = [
-        "# Clause-Variable Message-Passing SAT Depth Sweep",
-        "",
-        "Task: produce any assignment that satisfies a satisfiable 3-SAT formula.",
-        "Primary metric: valid-assignment rate (verified, not canonical exact match).",
-        "",
-        f"- Depths (rounds): `{args.depths}`",
-        f"- Train/val/test/OOD: `{args.n_train}/{args.n_val}/{args.n_test}/{args.n_test}`",
-        f"- In-distribution: `{args.n_vars}` vars, `{args.n_clauses}` clauses",
-        f"- OOD: `{args.ood_vars}` vars, `{args.ood_clauses}` clauses",
-        f"- Deep supervision: `{args.deep_supervision}`",
-        "",
-        "| depth | val valid | test valid | OOD valid | best val window | best test window | best OOD window |",
-        "| ---: | ---: | ---: | ---: | --- | --- | --- |",
-    ]
+    if args.labels_csv is not None:
+        data_root = _resolve_data_root(args)
+        lines = [
+            "# Clause-Variable Message-Passing SAT Depth Sweep (RandSATBench)",
+            "",
+            "Task: produce any assignment that satisfies a satisfiable 3-SAT formula.",
+            "Solver: permutation-equivariant clause-variable message passing, trained with the soft SAT loss.",
+            f"Data source: RandSATBench under `{data_root}` with labels from `{args.labels_csv}`.",
+            "Primary metric: valid-assignment rate (verified, not canonical exact match).",
+            "",
+            f"- Depths (rounds): `{args.depths}`",
+            f"- In-distribution vars: `{args.indist_vars}`",
+            f"- OOD vars: `{args.randsat_ood_vars}`",
+            f"- Val/test fractions: `{args.val_frac}` / `{args.test_frac}`",
+            f"- Max in-distribution / OOD examples: `{args.max_indist}` / `{args.max_ood}`",
+            f"- Deep supervision: `{args.deep_supervision}`",
+            "",
+            "| depth | val valid | test valid | OOD valid | best val window | best test window | best OOD window |",
+            "| ---: | ---: | ---: | ---: | --- | --- | --- |",
+        ]
+    else:
+        lines = [
+            "# Clause-Variable Message-Passing SAT Depth Sweep",
+            "",
+            "Task: produce any assignment that satisfies a satisfiable 3-SAT formula.",
+            "Primary metric: valid-assignment rate (verified, not canonical exact match).",
+            "",
+            f"- Depths (rounds): `{args.depths}`",
+            f"- Train/val/test/OOD: `{args.n_train}/{args.n_val}/{args.n_test}/{args.n_test}`",
+            f"- In-distribution: `{args.n_vars}` vars, `{args.n_clauses}` clauses",
+            f"- OOD: `{args.ood_vars}` vars, `{args.ood_clauses}` clauses",
+            f"- Deep supervision: `{args.deep_supervision}`",
+            "",
+            "| depth | val valid | test valid | OOD valid | best val window | best test window | best OOD window |",
+            "| ---: | ---: | ---: | ---: | --- | --- | --- |",
+        ]
     for summary in summaries:
         baselines = summary["baselines"]
         best = {row["split"]: row for row in summary["best_rows"]}
 
-        def _window(split: str) -> str:
-            if summary.get("rys_skipped"):
+        def _window(split: str, *, current_summary: dict = summary, current_best: dict = best) -> str:
+            if current_summary.get("rys_skipped"):
                 return "skipped"
-            row = best[split]
+            row = current_best[split]
             return f"({int(row['start'])}, {int(row['end'])}) Δ={row['delta_valid_assignment_rate']:+.3f}"
 
         lines.append(
@@ -579,15 +727,16 @@ def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace)
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     depths = parse_depths(args.depths)
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    loaders, max_vars, max_clauses = make_loaders(args)
+    loaders, max_vars, max_clauses, quality = make_loaders(args)
+    if quality is not None:
+        quality.to_csv(run_dir / "dataset_quality.csv", index=False)
     summaries = []
     for depth in depths:
         summaries.append(
@@ -606,5 +755,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

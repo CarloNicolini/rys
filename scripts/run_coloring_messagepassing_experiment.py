@@ -26,10 +26,12 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
@@ -42,41 +44,44 @@ from rys.coloring_data import (
 )
 from rys.coloring_message_passing import ColoringMessagePassingModel, ColoringMPConfig
 from rys.surgery import apply_rys
+from rys.training.modules import ColoringMPLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=47)
-    parser.add_argument("--depths", type=str, default="8,16,32")
-    parser.add_argument("--n-vertices", type=int, default=12)
-    parser.add_argument("--n-edges", type=int, default=24)
-    parser.add_argument("--n-colors", type=int, default=3)
-    parser.add_argument("--n-givens", type=int, default=3)
-    parser.add_argument(
-        "--ood-vertices",
-        type=int,
-        default=18,
+def main(
+    seed: int = typer.Option(47, help="Random seed."),
+    depths: str = typer.Option("8,16,32", help="Comma-separated message-passing depths (rounds) to sweep."),
+    n_vertices: int = typer.Option(12, help="In-distribution vertex count."),
+    n_edges: int = typer.Option(24, help="In-distribution edge count."),
+    n_colors: int = typer.Option(3, help="Number of colours k."),
+    n_givens: int = typer.Option(3, help="Revealed vertices per instance."),
+    ood_vertices: int = typer.Option(
+        18,
         help="Larger graph OOD (more vertices). Safe here because the solver is "
         "permutation-equivariant with a fixed colour vocabulary.",
-    )
-    parser.add_argument("--ood-edges", type=int, default=40)
-    parser.add_argument("--ood-givens", type=int, default=3)
-    parser.add_argument("--n-train", type=int, default=4096)
-    parser.add_argument("--n-val", type=int, default=1024)
-    parser.add_argument("--n-test", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--max-degree", type=int, default=24)
-    parser.add_argument("--given-ce-weight", type=float, default=0.25)
-    parser.add_argument("--capture-batches", type=int, default=4)
-    parser.add_argument("--skip-rys", action="store_true")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/coloring_messagepassing"))
-    return parser.parse_args()
+    ),
+    ood_edges: int = typer.Option(40, help="OOD edge count."),
+    ood_givens: int = typer.Option(3, help="OOD revealed vertices per instance."),
+    n_train: int = typer.Option(4096, help="Training examples."),
+    n_val: int = typer.Option(1024, help="Validation examples."),
+    n_test: int = typer.Option(1024, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(20, help="Training epochs."),
+    lr: float = typer.Option(5e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width (must be divisible by n-heads)."),
+    n_heads: int = typer.Option(4, help="Attention heads per round."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    max_degree: int = typer.Option(24, help="Max vertex degree embedding index."),
+    given_ce_weight: float = typer.Option(0.25, help="Cross-entropy weight anchoring given vertices."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the CKA connectome."),
+    skip_rys: bool = typer.Option(
+        False, "--skip-rys/--no-skip-rys", help="Train and export curves/CKA without RYS matrices."
+    ),
+    output_dir: Path = typer.Option(Path("results/coloring_messagepassing"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -312,22 +317,28 @@ def train_one_depth(args, *, n_rounds, loaders, max_v, device, run_dir) -> dict:
     model.to(device)
     params = count_parameters(model)
     print(json.dumps({"depth": n_rounds, "n_params_total": params["total"], "n_params_trainable": params["trainable"]}))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    lit = ColoringMPLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        given_ce_weight=args.given_ce_weight,
+        model_config=config,
+    )
+    trainer = build_trainer(
+        depth_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+        extra_log_fields={"depth": n_rounds},
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    ckpt = best_checkpoint_path(trainer)
 
-    history = []
-    for epoch in range(1, args.epochs + 1):
-        tr = train_epoch(model, loaders["train"], optimizer, device, given_ce_weight=args.given_ce_weight)
-        va = evaluate(model, loaders["val"], device)
-        row = {"epoch": epoch, "train_valid": tr["valid_coloring_rate"], "train_cell": tr["cell_accuracy"],
-               "val_valid": va["valid_coloring_rate"], "val_cell": va["cell_accuracy"]}
-        history.append(row)
-        print(json.dumps({"depth": n_rounds, **row}))
-    pd.DataFrame(history).to_csv(depth_dir / "train_history.csv", index=False)
-    ckpt = depth_dir / "checkpoint.pt"
-    torch.save({"model_state_dict": model.state_dict(), "config": config, "args": vars(args)}, ckpt)
-
-    reloaded, _ = build_model(args, n_rounds=n_rounds, max_v=max_v)
-    reloaded.load_state_dict(torch.load(ckpt, map_location=device, weights_only=False)["model_state_dict"])
+    reloaded, _ = load_rys_model(
+        ckpt,
+        lambda _config: build_model(args, n_rounds=n_rounds, max_v=max_v)[0],
+        map_location=device,
+    )
     reloaded.to(device)
 
     curves = {s: validity_vs_rounds(reloaded, loaders[s], device, n_rounds=n_rounds) for s in ("val", "test", "ood")}
@@ -387,10 +398,10 @@ def write_report(run_dir, summaries, args) -> None:
         best = {r["split"]: r for r in s["best_rows"]}
         bands = s["cka_bands"]
 
-        def _w(split: str) -> str:
-            if s.get("rys_skipped"):
+        def _w(split: str, *, current_summary: dict = s, current_best: dict = best) -> str:
+            if current_summary.get("rys_skipped"):
                 return "skipped"
-            r = best[split]
+            r = current_best[split]
             return f"({int(r['start'])},{int(r['end'])}) {r['delta_valid']:+.3f}"
 
         lines.append(
@@ -401,9 +412,8 @@ def write_report(run_dir, summaries, args) -> None:
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     depths = parse_depths(args.depths)
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
@@ -415,5 +425,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

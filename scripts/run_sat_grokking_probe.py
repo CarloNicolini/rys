@@ -25,13 +25,14 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import typer
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from rys.sat_data import (
     SatAssignmentDataset,
@@ -40,47 +41,48 @@ from rys.sat_data import (
     verify_assignment_tensor,
 )
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
+from rys.training.modules import SatMPLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=50)
-    parser.add_argument("--n-train", type=int, default=64, help="Size of the tiny fixed train set.")
-    parser.add_argument("--n-val", type=int, default=512, help="Held-out split (same distribution).")
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=24)
-    parser.add_argument("--n-rounds", type=int, default=16)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=4000)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.0,
+def main(
+    seed: int = typer.Option(50, help="Random seed."),
+    n_train: int = typer.Option(64, help="Size of the tiny fixed train set."),
+    n_val: int = typer.Option(512, help="Held-out split (same distribution)."),
+    n_vars: int = typer.Option(6, help="Variable count."),
+    n_clauses: int = typer.Option(24, help="Clause count."),
+    n_rounds: int = typer.Option(16, help="Message-passing depth (rounds)."),
+    d_model: int = typer.Option(64, help="Model width."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    epochs: int = typer.Option(4000, help="Training epochs (long, to probe delayed generalization)."),
+    lr: float = typer.Option(5e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(
+        0.0,
         help="0.0 maximises ability to memorise (pure capacity probe). "
         "Grokking proper usually needs a non-zero value, e.g. 1e-2.",
-    )
-    parser.add_argument("--batch-size", type=int, default=0, help="0 = full-batch over the tiny set.")
-    parser.add_argument("--deep-supervision", action="store_true", default=True)
-    parser.add_argument("--no-deep-supervision", dest="deep_supervision", action="store_false")
-    parser.add_argument(
-        "--variable-id-embeddings",
-        action="store_true",
-        default=False,
+    ),
+    batch_size: int = typer.Option(0, help="0 = full-batch over the tiny set."),
+    deep_supervision: bool = typer.Option(
+        True, "--deep-supervision/--no-deep-supervision", help="Average the soft-SAT loss over every round."
+    ),
+    variable_id_embeddings: bool = typer.Option(
+        False,
+        "--variable-id-embeddings/--no-variable-id-embeddings",
         help="Give each variable a distinct learned initial state, breaking "
         "permutation-equivariance (tests the Weisfeiler-Leman ceiling).",
-    )
-    parser.add_argument(
-        "--ce-weight",
-        type=float,
-        default=0.0,
+    ),
+    ce_weight: float = typer.Option(
+        0.0,
         help="Weight of a cross-entropy term toward the canonical assignment, "
         "added to the soft-SAT loss (tests the rounding-gap hypothesis).",
-    )
-    parser.add_argument("--eval-every", type=int, default=10, help="Epochs between train/val evaluations.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_grokking_probe"))
-    return parser.parse_args()
+    ),
+    eval_every: int = typer.Option(
+        10, help="Deprecated under Lightning (validation runs every epoch); kept for CLI compatibility."
+    ),
+    output_dir: Path = typer.Option(Path("results/sat_grokking_probe"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -214,9 +216,8 @@ def marginal_diagnostic(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -245,7 +246,6 @@ def main() -> None:
     )
     model = MessagePassingSatModel(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     print(
         json.dumps(
@@ -263,66 +263,43 @@ def main() -> None:
         )
     )
 
-    history: list[dict] = []
-    best_train_valid = 0.0
-    best_val_valid = 0.0
-    progress = tqdm(range(1, args.epochs + 1), desc="grokking probe", unit="ep", dynamic_ncols=True)
-    for epoch in progress:
-        model.train()
-        for batch in train_loader:
-            labels = batch["assignment_labels"].to(device)
-            mask = batch["assignment_mask"].to(device)
-            cvi, csi, cm = clause_tensors(batch, device)
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(
-                clause_variable_ids=cvi,
-                clause_sign_ids=csi,
-                clause_mask=cm,
-                return_round_logits=args.deep_supervision,
-            )
-            loss = supervised_loss(
-                outputs["round_logits"] or [],
-                outputs["logits"],
-                cvi,
-                csi,
-                cm,
-                labels,
-                mask,
-                deep_supervision=args.deep_supervision,
-                ce_weight=args.ce_weight,
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+    lit = SatMPLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        deep_supervision=args.deep_supervision,
+        ce_weight=args.ce_weight,
+        model_config=config.__dict__,
+    )
+    trainer = build_trainer(
+        run_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+    )
+    trainer.fit(lit, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    checkpoint_path = best_checkpoint_path(trainer)
+    model, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: MessagePassingSatModel(config),
+        map_location=device,
+    )
+    model.to(device)
 
-        if epoch % args.eval_every == 0 or epoch == 1 or epoch == args.epochs:
-            train_metrics = evaluate(model, train_eval_loader, device)
-            val_metrics = evaluate(model, val_loader, device)
-            best_train_valid = max(best_train_valid, train_metrics["valid_assignment_rate"])
-            best_val_valid = max(best_val_valid, val_metrics["valid_assignment_rate"])
-            history.append(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_metrics["loss"],
-                    "train_bit_accuracy": train_metrics["bit_accuracy"],
-                    "train_valid_assignment_rate": train_metrics["valid_assignment_rate"],
-                    "val_loss": val_metrics["loss"],
-                    "val_bit_accuracy": val_metrics["bit_accuracy"],
-                    "val_valid_assignment_rate": val_metrics["valid_assignment_rate"],
-                }
-            )
-            pct = 100.0 * epoch / args.epochs
-            progress.set_postfix(
-                {
-                    "pct": f"{pct:5.1f}%",
-                    "tr_valid": f"{train_metrics['valid_assignment_rate']:.3f}",
-                    "va_valid": f"{val_metrics['valid_assignment_rate']:.3f}",
-                    "best_tr": f"{best_train_valid:.3f}",
-                }
-            )
-
-    history_df = pd.DataFrame(history)
-    history_df.to_csv(run_dir / "train_history.csv", index=False)
+    history_df = pd.read_csv(run_dir / "train_history.csv")
+    train_metrics = evaluate(model, train_eval_loader, device)
+    val_metrics = evaluate(model, val_loader, device)
+    final = {
+        "epoch": int(history_df["epoch"].max()) if not history_df.empty else args.epochs,
+        "train_loss": train_metrics["loss"],
+        "train_bit_accuracy": train_metrics["bit_accuracy"],
+        "train_valid_assignment_rate": train_metrics["valid_assignment_rate"],
+        "val_loss": val_metrics["loss"],
+        "val_bit_accuracy": val_metrics["bit_accuracy"],
+        "val_valid_assignment_rate": val_metrics["valid_assignment_rate"],
+    }
+    best_train_valid = float(history_df.get("train_valid_assignment_rate", pd.Series([final["train_valid_assignment_rate"]])).max())
+    best_val_valid = float(history_df.get("val_valid_assignment_rate", pd.Series([final["val_valid_assignment_rate"]])).max())
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(history_df["epoch"], history_df["train_valid_assignment_rate"], label="train validity", color="#c2410c")
@@ -343,11 +320,11 @@ def main() -> None:
 
     diagnostic = marginal_diagnostic(model, train_eval_loader, device, run_dir)
 
-    final = history[-1]
     summary = {
         "args": vars(args),
         "n_params": n_params,
         "device": str(device),
+        "checkpoint": str(checkpoint_path),
         "final": final,
         "best_train_valid_assignment_rate": best_train_valid,
         "best_val_valid_assignment_rate": best_val_valid,
@@ -366,5 +343,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

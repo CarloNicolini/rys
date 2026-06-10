@@ -7,10 +7,12 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
@@ -24,34 +26,39 @@ from rys.tiny_transformer import (
     FactorizedAssignmentTransformerConfig,
     FactorizedCNFAssignmentTransformer,
 )
+from rys.training.modules import AssignmentLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--depths", type=str, default="8,16,32")
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=24)
-    parser.add_argument("--ood-vars", type=int, default=8)
-    parser.add_argument("--ood-clauses", type=int, default=34)
-    parser.add_argument("--n-train", type=int, default=4096)
-    parser.add_argument("--n-val", type=int, default=1024)
-    parser.add_argument("--n-test", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--max-repeat", type=int, default=2)
-    parser.add_argument("--capture-batches", type=int, default=4)
-    parser.add_argument("--sat-loss-weight", type=float, default=1.0)
-    parser.add_argument("--ce-loss-weight", type=float, default=0.0)
-    parser.add_argument("--skip-rys", action="store_true", help="Train and export CKA/baselines without RYS matrices.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_assignment_generation"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(41, help="Random seed."),
+    depths: str = typer.Option("8,16,32", help="Comma-separated transformer depths (layers) to sweep."),
+    n_vars: int = typer.Option(6, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(24, help="In-distribution clause count."),
+    ood_vars: int = typer.Option(8, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(34, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(4096, help="Training examples."),
+    n_val: int = typer.Option(1024, help="Validation examples."),
+    n_test: int = typer.Option(1024, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(20, help="Training epochs."),
+    lr: float = typer.Option(3e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width (must be divisible by n-heads)."),
+    n_heads: int = typer.Option(4, help="Attention heads per layer."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    dropout: float = typer.Option(0.0, help="Dropout probability."),
+    max_repeat: int = typer.Option(2, help="Total traversals of each RYS window."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the CKA connectome."),
+    sat_loss_weight: float = typer.Option(1.0, help="Weight on the soft-SAT loss term."),
+    ce_loss_weight: float = typer.Option(0.0, help="Weight on the canonical-assignment cross-entropy term."),
+    skip_rys: bool = typer.Option(
+        False, "--skip-rys/--no-skip-rys", help="Train and export CKA/baselines without RYS matrices."
+    ),
+    output_dir: Path = typer.Option(Path("results/sat_assignment_generation"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -496,40 +503,29 @@ def train_one_depth(
     quality.to_csv(depth_dir / "dataset_quality.csv", index=False)
     model, config = build_model(args, n_layers=n_layers, max_vars=max_vars, max_clauses=max_clauses)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    lit = AssignmentLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        sat_loss_weight=args.sat_loss_weight,
+        ce_loss_weight=args.ce_loss_weight,
+        model_config=config,
+    )
+    trainer = build_trainer(
+        depth_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+        extra_log_fields={"depth": n_layers},
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    checkpoint_path = best_checkpoint_path(trainer)
 
-    history = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model,
-            loaders["train"],
-            optimizer,
-            device,
-            sat_loss_weight=args.sat_loss_weight,
-            ce_loss_weight=args.ce_loss_weight,
-        )
-        val_metrics = evaluate(
-            model,
-            loaders["val"],
-            device,
-            sat_loss_weight=args.sat_loss_weight,
-            ce_loss_weight=args.ce_loss_weight,
-        )
-        row = {
-            "epoch": epoch,
-            **{f"train_{key}": value for key, value in train_metrics.items()},
-            **{f"val_{key}": value for key, value in val_metrics.items()},
-        }
-        history.append(row)
-        print(json.dumps({"depth": n_layers, **row}))
-    pd.DataFrame(history).to_csv(depth_dir / "train_history.csv", index=False)
-
-    checkpoint_path = depth_dir / "checkpoint.pt"
-    torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
-
-    reloaded, _ = build_model(args, n_layers=n_layers, max_vars=max_vars, max_clauses=max_clauses)
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    reloaded.load_state_dict(payload["model_state_dict"])
+    reloaded, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: build_model(args, n_layers=n_layers, max_vars=max_vars, max_clauses=max_clauses)[0],
+        map_location=device,
+    )
     reloaded.to(device)
 
     activations = capture_query_residual_stream(
@@ -643,10 +639,10 @@ def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace)
         best = {row["split"]: row for row in summary["best_rows"]}
         baselines = summary["baselines"]
 
-        def _window(split: str) -> str:
-            if summary.get("rys_skipped"):
+        def _window(split: str, *, current_summary: dict = summary, current_best: dict = best) -> str:
+            if current_summary.get("rys_skipped"):
                 return "skipped"
-            row = best[split]
+            row = current_best[split]
             return f"({int(row['start'])}, {int(row['end'])}) Δ={row['delta_valid_assignment_rate']:+.3f}"
 
         lines.append(
@@ -662,9 +658,8 @@ def write_report(run_dir: Path, summaries: list[dict], args: argparse.Namespace)
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     depths = parse_depths(args.depths)
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
@@ -691,5 +686,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

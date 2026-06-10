@@ -20,10 +20,11 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.sat_data import (
@@ -35,33 +36,36 @@ from rys.sat_data import (
     verify_assignment_tensor,
 )
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
+from rys.training.modules import SatCoverageLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=46)
-    parser.add_argument("--depth", type=int, default=16)
-    parser.add_argument("--regimes", type=str, default="floor,best_of_k")
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=24)
-    parser.add_argument("--ood-vars", type=int, default=8)
-    parser.add_argument("--ood-clauses", type=int, default=34)
-    parser.add_argument("--n-train", type=int, default=4096)
-    parser.add_argument("--n-val", type=int, default=1024)
-    parser.add_argument("--n-test", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=18)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--n-samples", type=int, default=20)
-    parser.add_argument("--train-k", type=int, default=4, help="K trajectories for best_of_k / diversity.")
-    parser.add_argument("--floor-sigma", type=float, default=0.7, help="Target std for the 'floor' regime.")
-    parser.add_argument("--floor-reg", type=float, default=0.2, help="Variance-floor penalty weight.")
-    parser.add_argument("--diversity-weight", type=float, default=0.1, help="Per-bit spread reward weight.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_coverage"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(46, help="Random seed."),
+    depth: int = typer.Option(16, help="Message-passing depth (rounds)."),
+    regimes: str = typer.Option("floor,best_of_k", help="Comma list of training regimes to compare."),
+    n_vars: int = typer.Option(6, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(24, help="In-distribution clause count."),
+    ood_vars: int = typer.Option(8, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(34, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(4096, help="Training examples."),
+    n_val: int = typer.Option(1024, help="Validation examples."),
+    n_test: int = typer.Option(1024, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(18, help="Training epochs."),
+    lr: float = typer.Option(5e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    n_samples: int = typer.Option(20, help="N for valid@N / coverage."),
+    train_k: int = typer.Option(4, help="K trajectories for best_of_k / diversity."),
+    floor_sigma: float = typer.Option(0.7, help="Target std for the 'floor' regime."),
+    floor_reg: float = typer.Option(0.2, help="Variance-floor penalty weight."),
+    diversity_weight: float = typer.Option(0.1, help="Per-bit spread reward weight."),
+    output_dir: Path = typer.Option(Path("results/sat_coverage"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -129,10 +133,7 @@ def train(model, loaders, optimizer, device, args, regime) -> list[dict]:
                 if out["mean_log_sigma"] is not None:
                     sigma_terms.append(out["mean_log_sigma"])
             stacked = torch.stack(sample_losses)  # (K, B)
-            if regime == "best_of_k":
-                loss = stacked.min(dim=0).values.mean()
-            else:  # floor regime: mean loss + explicit diversity + variance floor
-                loss = stacked.mean()
+            loss = stacked.min(dim=0).values.mean() if regime == "best_of_k" else stacked.mean()
             if args.diversity_weight > 0:
                 div = diversity_reward(torch.stack(sample_probs), amask)
                 loss = loss - args.diversity_weight * div
@@ -186,14 +187,36 @@ def run_regime(args, regime, loaders, max_vars, max_clauses, device, run_dir) ->
         max_vars=max_vars, max_clauses=max_clauses, d_model=args.d_model, n_rounds=args.depth,
         d_mlp=args.d_mlp, pre_norm=True, stochastic=True, log_sigma_init=-1.0,
     )
-    model = MessagePassingSatModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    history = train(model, loaders, optimizer, device, args, regime)
     rdir = run_dir / regime
     rdir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(history).to_csv(rdir / "train_history.csv", index=False)
-    torch.save({"model_state_dict": model.state_dict(), "config": config.__dict__, "args": vars(args)}, rdir / "checkpoint.pt")
-    result = {"regime": regime, "splits": {}}
+    model = MessagePassingSatModel(config).to(device)
+    lit = SatCoverageLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        regime=regime,
+        train_k=args.train_k,
+        floor_sigma=args.floor_sigma,
+        floor_reg=args.floor_reg,
+        diversity_weight=args.diversity_weight,
+        model_config=config.__dict__,
+    )
+    trainer = build_trainer(
+        rdir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+        extra_log_fields={"regime": regime},
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    checkpoint_path = best_checkpoint_path(trainer)
+    model, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: MessagePassingSatModel(config),
+        map_location=device,
+    )
+    model.to(device)
+    result = {"regime": regime, "checkpoint": str(checkpoint_path), "splits": {}}
     for split in ("val", "test", "ood"):
         entry = {
             "single_sample_valid": single_sample_validity(model, loaders[split], device),
@@ -225,9 +248,8 @@ def save_bar(results, path):
     plt.close(fig)
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -239,5 +261,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

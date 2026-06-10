@@ -20,10 +20,12 @@ import random
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
@@ -39,41 +41,44 @@ from rys.sorted_translation_transformer import (
 )
 from rys.surgery import apply_rys
 from rys.theory_validation import rho_phi_table, theory_fit
+from rys.training.modules import SortedTranslationLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--train-len", type=int, default=16, help="In-distribution validation length.")
-    parser.add_argument(
-        "--train-lens",
-        type=str,
-        default="",
-        help="Comma list of training lengths for mixed-length training. Empty = single --train-len.",
-    )
-    parser.add_argument("--ood-lens", type=str, default="24,32,48")
-    parser.add_argument("--vocab", type=int, default=128)
-    parser.add_argument("--n-train", type=int, default=8192)
-    parser.add_argument("--n-val", type=int, default=2048)
-    parser.add_argument("--n-test", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--n-layers", type=int, default=3)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--d-mlp", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--weight-tied", action="store_true")
-    parser.add_argument("--post-norm", dest="pre_norm", action="store_false")
-    parser.set_defaults(pre_norm=True)
-    parser.add_argument("--max-repeat", type=int, default=6)
-    parser.add_argument("--capture-batches", type=int, default=4)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Load weights and skip training.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sorted_translation"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(0, help="Random seed."),
+    train_len: int = typer.Option(16, help="In-distribution train/validation length."),
+    train_lens: str = typer.Option(
+        "", help="Comma list of training lengths for mixed-length training. Empty = single --train-len."
+    ),
+    ood_lens: str = typer.Option("24,32,48", help="Comma list of out-of-distribution lengths."),
+    vocab: int = typer.Option(128, help="Token vocabulary size."),
+    n_train: int = typer.Option(8192, help="Training examples."),
+    n_val: int = typer.Option(2048, help="Validation examples."),
+    n_test: int = typer.Option(2048, help="Test (per OOD length) examples."),
+    batch_size: int = typer.Option(256, help="Batch size."),
+    epochs: int = typer.Option(400, help="Training epochs."),
+    lr: float = typer.Option(1e-3, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(0.1, help="AdamW weight decay (heavy, to force grokking)."),
+    d_model: int = typer.Option(128, help="Model width (must be divisible by n-heads)."),
+    n_layers: int = typer.Option(3, help="Number of transformer layers."),
+    n_heads: int = typer.Option(4, help="Attention heads per layer."),
+    d_mlp: int = typer.Option(512, help="MLP hidden width."),
+    dropout: float = typer.Option(0.0, help="Dropout probability."),
+    weight_tied: bool = typer.Option(
+        False, "--weight-tied/--no-weight-tied", help="Share one round across depth (iterated map)."
+    ),
+    pre_norm: bool = typer.Option(True, "--pre-norm/--post-norm", help="Pre-norm (additive residual) vs post-norm."),
+    max_repeat: int = typer.Option(6, help="Maximum total traversals of a window in the RYS sweep."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the CKA connectome."),
+    log_every: int = typer.Option(
+        10, help="Deprecated under Lightning (validation runs every epoch); kept for CLI compatibility."
+    ),
+    checkpoint: Path | None = typer.Option(None, help="Load weights and skip training."),
+    output_dir: Path = typer.Option(Path("results/sorted_translation"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -464,9 +469,8 @@ def write_report(run_dir: Path, *, args: argparse.Namespace, baselines: dict, be
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -477,37 +481,29 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(json.dumps({"n_params": n_params, "train_lens": train_lens, "config": config, "device": str(device)}, default=str))
 
-    checkpoint_path = run_dir / "checkpoint.pt"
     if args.checkpoint is not None:
-        payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(payload["model_state_dict"])
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+        checkpoint_path = args.checkpoint
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        history = []
-        for epoch in range(1, args.epochs + 1):
-            train_metrics = train_epoch(model, train_loaders, optimizer, device)
-            if epoch % args.log_every == 0 or epoch == 1 or epoch == args.epochs:
-                val_metrics = evaluate(model, loaders["val"], device)
-                row = {
-                    "epoch": epoch,
-                    "train_loss": train_metrics["loss"],
-                    "train_token_accuracy": train_metrics["token_accuracy"],
-                    "train_sequence_accuracy": train_metrics["sequence_accuracy"],
-                    "val_loss": val_metrics["loss"],
-                    "val_token_accuracy": val_metrics["token_accuracy"],
-                    "val_sequence_accuracy": val_metrics["sequence_accuracy"],
-                    "val_sortedness": val_metrics["sortedness"],
-                    **weight_norms(model),
-                }
-                history.append(row)
-                print(json.dumps(row))
-        pd.DataFrame(history).to_csv(run_dir / "train_history.csv", index=False)
-        torch.save({"model_state_dict": model.state_dict(), "args": vars(args), "config": config}, checkpoint_path)
+        lit = SortedTranslationLitModule(
+            model,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            model_config=config,
+        )
+        trainer = build_trainer(
+            run_dir,
+            max_epochs=args.epochs,
+            monitor=lit.primary_metric,
+            mode=lit.primary_mode,
+        )
+        trainer.fit(lit, train_dataloaders=train_loaders, val_dataloaders=loaders["val"])
+        checkpoint_path = best_checkpoint_path(trainer)
 
-    reloaded, _ = build_model(args)
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    reloaded.load_state_dict(payload["model_state_dict"])
+    reloaded, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: build_model(args)[0],
+        map_location=device,
+    )
     reloaded.to(device)
 
     baselines = {split: evaluate(reloaded, loaders[split], device) for split in eval_splits}
@@ -546,6 +542,7 @@ def main() -> None:
         "device": str(device),
         "n_params": n_params,
         "config": config,
+        "checkpoint": str(checkpoint_path),
         "baselines": baselines,
         "best_windows": best_windows,
         "theory_fit": fit,
@@ -555,5 +552,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

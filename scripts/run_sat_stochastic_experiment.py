@@ -18,10 +18,11 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
+import typer
 from torch.utils.data import DataLoader
 
 from rys.sat_data import (
@@ -34,32 +35,35 @@ from rys.sat_data import (
 )
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
 from rys.surgery import apply_rys
+from rys.training.modules import SatStochasticLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=45)
-    parser.add_argument("--depth", type=int, default=16)
-    parser.add_argument("--modes", type=str, default="deterministic,stochastic")
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=24)
-    parser.add_argument("--ood-vars", type=int, default=8)
-    parser.add_argument("--ood-clauses", type=int, default=34)
-    parser.add_argument("--n-train", type=int, default=4096)
-    parser.add_argument("--n-val", type=int, default=1024)
-    parser.add_argument("--n-test", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--n-samples", type=int, default=20, help="N for valid@N / coverage.")
-    parser.add_argument("--sigma-floor", type=float, default=0.1, help="Target min std; penalise sigma below it.")
-    parser.add_argument("--sigma-reg", type=float, default=1e-2, help="Weight of the variance-floor penalty.")
-    parser.add_argument("--rys-window", type=str, default="13,15", help="Half-open late window for the RYS probe.")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/sat_stochastic"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(45, help="Random seed."),
+    depth: int = typer.Option(16, help="Message-passing depth (rounds)."),
+    modes: str = typer.Option("deterministic,stochastic", help="Comma list of modes to compare."),
+    n_vars: int = typer.Option(6, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(24, help="In-distribution clause count."),
+    ood_vars: int = typer.Option(8, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(34, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(4096, help="Training examples."),
+    n_val: int = typer.Option(1024, help="Validation examples."),
+    n_test: int = typer.Option(1024, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(20, help="Training epochs."),
+    lr: float = typer.Option(5e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    n_samples: int = typer.Option(20, help="N for valid@N / coverage."),
+    sigma_floor: float = typer.Option(0.1, help="Target min std; penalise sigma below it."),
+    sigma_reg: float = typer.Option(1e-2, help="Weight of the variance-floor penalty."),
+    rys_window: str = typer.Option("13,15", help="Half-open late window for the RYS probe (end < depth)."),
+    output_dir: Path = typer.Option(Path("results/sat_stochastic"), help="Run output directory."),
+) -> None:
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -177,16 +181,36 @@ def run_mode(args, mode, loaders, max_vars, max_clauses, device, run_dir) -> dic
         max_vars=max_vars, max_clauses=max_clauses, d_model=args.d_model, n_rounds=args.depth,
         d_mlp=args.d_mlp, pre_norm=True, stochastic=stochastic,
     )
-    model = MessagePassingSatModel(config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    history = train(model, loaders, optimizer, device, args, stochastic)
     mode_dir = run_dir / mode
     mode_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(history).to_csv(mode_dir / "train_history.csv", index=False)
-    torch.save({"model_state_dict": model.state_dict(), "config": config.__dict__, "args": vars(args)}, mode_dir / "checkpoint.pt")
+    model = MessagePassingSatModel(config).to(device)
+    lit = SatStochasticLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        sigma_floor=args.sigma_floor,
+        sigma_reg=args.sigma_reg,
+        stochastic_sample=stochastic,
+        model_config=config.__dict__,
+    )
+    trainer = build_trainer(
+        mode_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+        extra_log_fields={"mode": mode, "stochastic": stochastic},
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    checkpoint_path = best_checkpoint_path(trainer)
+    model, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: MessagePassingSatModel(config),
+        map_location=device,
+    )
+    model.to(device)
 
     window = tuple(int(x) for x in args.rys_window.split(","))
-    result = {"mode": mode, "stochastic": stochastic, "rys_window": list(window), "splits": {}}
+    result = {"mode": mode, "stochastic": stochastic, "checkpoint": str(checkpoint_path), "rys_window": list(window), "splits": {}}
     for split in ("val", "test", "ood"):
         entry = {
             "single_sample_valid": single_sample_validity(model, loaders[split], device),
@@ -223,9 +247,8 @@ def save_bar(results: list[dict], path: Path) -> None:
     plt.close(fig)
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -237,5 +260,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

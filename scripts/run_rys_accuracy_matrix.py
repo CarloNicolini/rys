@@ -7,11 +7,13 @@ import json
 import time
 from pathlib import Path
 
+import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
@@ -23,38 +25,38 @@ from rys.tiny_transformer import (
     TinySatTransformer,
     TinyTransformerConfig,
 )
+from rys.training.modules import ClassifierLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--seed", type=int, default=30)
-    parser.add_argument("--architecture", choices=["flat", "factorized"], default="factorized")
-    parser.add_argument("--n-vars", type=int, default=4)
-    parser.add_argument("--n-clauses", type=int, default=12)
-    parser.add_argument("--ood-vars", type=int, default=5)
-    parser.add_argument("--ood-clauses", type=int, default=16)
-    parser.add_argument("--n-train", type=int, default=8192)
-    parser.add_argument("--n-val", type=int, default=2048)
-    parser.add_argument("--n-test", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--n-layers", type=int, default=32)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--max-repeat", type=int, default=2, help="Total traversals of the inclusive window.")
-    parser.add_argument(
-        "--capture-batches",
-        type=int,
-        default=4,
-        help="Validation batches used for the static CKA connectome.",
-    )
-    parser.add_argument("--output-dir", type=Path, default=Path("results/rys_accuracy_matrix"))
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint to load instead of training.")
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(30, help="Random seed."),
+    architecture: str = typer.Option("factorized", help="Model architecture: 'flat' or 'factorized'."),
+    n_vars: int = typer.Option(4, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(12, help="In-distribution clause count (keep the ratio high enough for UNSAT)."),
+    ood_vars: int = typer.Option(5, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(16, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(8192, help="Training examples."),
+    n_val: int = typer.Option(2048, help="Validation examples."),
+    n_test: int = typer.Option(2048, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(128, help="Batch size."),
+    epochs: int = typer.Option(30, help="Training epochs."),
+    lr: float = typer.Option(3e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    d_model: int = typer.Option(64, help="Model width (must be divisible by n-heads)."),
+    n_layers: int = typer.Option(32, help="Number of transformer layers."),
+    n_heads: int = typer.Option(4, help="Attention heads per layer."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    dropout: float = typer.Option(0.0, help="Dropout probability."),
+    max_repeat: int = typer.Option(2, help="Total traversals of the inclusive window."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the static CKA connectome."),
+    output_dir: Path = typer.Option(Path("results/rys_accuracy_matrix"), help="Run output directory."),
+    checkpoint: Path | None = typer.Option(None, help="Optional checkpoint to load instead of training."),
+) -> None:
+    if architecture not in ("flat", "factorized"):
+        raise typer.BadParameter("architecture must be 'flat' or 'factorized'.")
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -317,40 +319,23 @@ def train_or_load(
     device: torch.device,
     run_dir: Path,
 ) -> tuple[list[dict[str, float]], Path]:
-    checkpoint_path = args.checkpoint or run_dir / "checkpoint.pt"
     if args.checkpoint is not None:
-        payload = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(payload["model_state_dict"])
         return [], args.checkpoint
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    history = []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model,
-            loaders["train"],
-            optimizer,
-            device,
-            architecture=args.architecture,
-        )
-        val_metrics = evaluate(model, loaders["val"], device, architecture=args.architecture)
-        row = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_accuracy": train_metrics["accuracy"],
-            "val_loss": val_metrics["loss"],
-            "val_accuracy": val_metrics["accuracy"],
-        }
-        history.append(row)
-        print(json.dumps(row))
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "args": vars(args),
-        },
-        checkpoint_path,
+    lit = ClassifierLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        model_config=getattr(model, "config", None),
     )
-    return history, checkpoint_path
+    trainer = build_trainer(
+        run_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    return [], best_checkpoint_path(trainer)
 
 
 def strict_upper_windows(n_layers: int) -> list[tuple[int, int]]:
@@ -547,9 +532,8 @@ def write_report(
     (run_dir / "report.md").write_text("\n".join(lines) + "\n")
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
     run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -560,15 +544,15 @@ def main() -> None:
 
     model, config = build_model(args, max_vars, max_clauses)
     model.to(device)
-    history, checkpoint_path = train_or_load(args, model, loaders, device, run_dir)
-    if history:
-        pd.DataFrame(history).to_csv(run_dir / "train_history.csv", index=False)
+    _, checkpoint_path = train_or_load(args, model, loaders, device, run_dir)
 
     # Reload from disk before the intervention sweep so the matrix is explicitly
     # computed from the fixed checkpointed weights.
-    reloaded_model, _ = build_model(args, max_vars, max_clauses)
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    reloaded_model.load_state_dict(payload["model_state_dict"])
+    reloaded_model, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: build_model(args, max_vars, max_clauses)[0],
+        map_location=device,
+    )
     reloaded_model.to(device)
 
     cka = compute_cka_connectome(
@@ -640,5 +624,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)

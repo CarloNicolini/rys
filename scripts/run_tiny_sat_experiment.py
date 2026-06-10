@@ -13,10 +13,12 @@ import math
 import time
 from pathlib import Path
 
+import lightning as L
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import typer
 from torch.utils.data import DataLoader
 
 from rys.cka import cka_matrix
@@ -30,35 +32,40 @@ from rys.tiny_transformer import (
     TinySatTransformer,
     TinyTransformerConfig,
 )
+from rys.training.modules import ClassifierLitModule
+from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--n-vars", type=int, default=6)
-    parser.add_argument("--n-clauses", type=int, default=18)
-    parser.add_argument("--ood-vars", type=int, default=7)
-    parser.add_argument("--ood-clauses", type=int, default=24)
-    parser.add_argument("--n-train", type=int, default=1024)
-    parser.add_argument("--n-val", type=int, default=256)
-    parser.add_argument("--n-test", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--architecture", choices=["flat", "factorized"], default="factorized")
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--d-mlp", type=int, default=128)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--min-window", type=int, default=2)
-    parser.add_argument("--max-window", type=int, default=4)
-    parser.add_argument("--max-repeat", type=int, default=4)
-    parser.add_argument("--top-k-windows", type=int, default=8)
-    parser.add_argument("--capture-batches", type=int, default=4)
-    parser.add_argument("--output-dir", type=Path, default=Path("results/tiny_sat"))
-    return parser.parse_args()
+def main(
+    seed: int = typer.Option(0, help="Random seed."),
+    n_vars: int = typer.Option(6, help="In-distribution variable count."),
+    n_clauses: int = typer.Option(18, help="In-distribution clause count (keep the ratio high enough for UNSAT)."),
+    ood_vars: int = typer.Option(7, help="Out-of-distribution variable count."),
+    ood_clauses: int = typer.Option(24, help="Out-of-distribution clause count."),
+    n_train: int = typer.Option(1024, help="Training examples."),
+    n_val: int = typer.Option(256, help="Validation examples."),
+    n_test: int = typer.Option(256, help="Test (and OOD) examples."),
+    batch_size: int = typer.Option(64, help="Batch size."),
+    epochs: int = typer.Option(8, help="Training epochs."),
+    lr: float = typer.Option(3e-4, help="AdamW learning rate."),
+    weight_decay: float = typer.Option(1e-2, help="AdamW weight decay."),
+    architecture: str = typer.Option("factorized", help="Model architecture: 'flat' or 'factorized'."),
+    d_model: int = typer.Option(64, help="Model width (must be divisible by n-heads)."),
+    n_layers: int = typer.Option(6, help="Number of transformer layers."),
+    n_heads: int = typer.Option(4, help="Attention heads per layer."),
+    d_mlp: int = typer.Option(128, help="MLP hidden width."),
+    dropout: float = typer.Option(0.0, help="Dropout probability."),
+    min_window: int = typer.Option(2, help="Minimum RYS window length to score."),
+    max_window: int = typer.Option(4, help="Maximum RYS window length to score."),
+    max_repeat: int = typer.Option(4, help="Maximum total traversals of a window."),
+    top_k_windows: int = typer.Option(8, help="Number of top-scoring windows to evaluate."),
+    capture_batches: int = typer.Option(4, help="Validation batches used for the CKA connectome."),
+    output_dir: Path = typer.Option(Path("results/tiny_sat"), help="Run output directory."),
+) -> None:
+    if architecture not in ("flat", "factorized"):
+        raise typer.BadParameter("architecture must be 'flat' or 'factorized'.")
+    args = argparse.Namespace(**locals())
+    _run(args)
 
 
 def resolve_device() -> torch.device:
@@ -281,10 +288,11 @@ def split_quality(splits: dict[str, list]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+def _run(args: argparse.Namespace) -> None:
+    L.seed_everything(args.seed, workers=True)
     device = resolve_device()
+    run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     max_vars = max(args.n_vars, args.ood_vars)
     max_clauses = max(args.n_clauses, args.ood_clauses)
@@ -340,34 +348,31 @@ def main() -> None:
     else:
         model = FactorizedCNFSatTransformer(factorized_config).to(device)
         saved_config = factorized_config.__dict__ | {"max_seq_len": factorized_config.max_seq_len}
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    history = []
     t0 = time.time()
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model,
-            loaders["train"],
-            optimizer,
-            device,
-            architecture=args.architecture,
-        )
-        val_metrics = evaluate(
-            model,
-            loaders["val"],
-            device,
-            architecture=args.architecture,
-        )
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_metrics["loss"],
-                "train_accuracy": train_metrics["accuracy"],
-                "val_loss": val_metrics["loss"],
-                "val_accuracy": val_metrics["accuracy"],
-            }
-        )
-        print(json.dumps(history[-1]))
+    lit = ClassifierLitModule(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        model_config=saved_config,
+    )
+    trainer = build_trainer(
+        run_dir,
+        max_epochs=args.epochs,
+        monitor=lit.primary_metric,
+        mode=lit.primary_mode,
+    )
+    trainer.fit(lit, train_dataloaders=loaders["train"], val_dataloaders=loaders["val"])
+    checkpoint_path = best_checkpoint_path(trainer)
+    model, _ = load_rys_model(
+        checkpoint_path,
+        lambda _config: (
+            TinySatTransformer(config)
+            if args.architecture == "flat"
+            else FactorizedCNFSatTransformer(factorized_config)
+        ),
+        map_location=device,
+    )
+    model.to(device)
 
     base_metrics = {
         split: evaluate(model, loader, device, architecture=args.architecture)
@@ -444,10 +449,6 @@ def main() -> None:
             print(json.dumps(rys_rows[-1]))
 
     elapsed = time.time() - t0
-    run_dir = args.output_dir / time.strftime("%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    pd.DataFrame(history).to_csv(run_dir / "train_history.csv", index=False)
     quality.to_csv(run_dir / "dataset_quality.csv", index=False)
     pd.DataFrame(rys_rows).to_csv(run_dir / "rys_window_metrics.csv", index=False)
     window_scores.to_csv(run_dir / "window_scores.csv", index=False)
@@ -459,6 +460,7 @@ def main() -> None:
         "args": vars(args),
         "device": str(device),
         "config": saved_config,
+        "checkpoint": str(checkpoint_path),
         "dataset_quality": quality.to_dict(orient="records"),
         "base_metrics": base_metrics,
         "selected_windows": selected,
@@ -468,5 +470,8 @@ def main() -> None:
     print(f"Wrote {run_dir}")
 
 
+main.__doc__ = __doc__
+
+
 if __name__ == "__main__":
-    main()
+    typer.run(main)
