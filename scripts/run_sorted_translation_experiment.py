@@ -41,7 +41,9 @@ from rys.sorted_translation_transformer import (
 )
 from rys.surgery import apply_rys
 from rys.theory_validation import rho_phi_table, theory_fit
+from rys.training.device_cache import cache_batches_on_device
 from rys.training.modules import SortedTranslationLitModule
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
@@ -339,13 +341,14 @@ def rys_sweep(
     rows = []
     windows = rys_windows(n_layers)
     for split in eval_splits:
-        base = evaluate(model, loaders[split], device)
-        for window in windows:
+        cached = cache_batches_on_device(loaders[split], device)
+        base = evaluate(model, cached, device)
+        for window in log_rys_progress(windows, device=device, split=split, n_layers=n_layers):
             for n_repeats in range(1, max_repeat + 1):
                 if n_repeats == 1:
                     metrics = base
                 else:
-                    metrics = evaluate(model, loaders[split], device, window=window, n_repeats=n_repeats)
+                    metrics = evaluate(model, cached, device, window=window, n_repeats=n_repeats)
                 row = {
                     "split": split,
                     "start": window[0],

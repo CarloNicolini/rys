@@ -37,7 +37,9 @@ from rys.nqueens_data import (
 )
 from rys.nqueens_message_passing import QueensMessagePassingModel, QueensMPConfig
 from rys.surgery import apply_rys
+from rys.training.device_cache import cache_batches_on_device
 from rys.training.modules import NqueensMPLitModule
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
@@ -239,11 +241,12 @@ def strict_windows(n_rounds: int, min_span: int = 2) -> list[tuple[int, int]]:
 
 
 def delta_matrix(model, loader, device, n_rounds) -> tuple[pd.DataFrame, float, pd.DataFrame]:
-    base = evaluate(model, loader, device)["valid_board_rate"]
+    cached = cache_batches_on_device(loader, device)
+    base = evaluate(model, cached, device)["valid_board_rate"]
     mat = np.full((n_rounds, n_rounds), np.nan)
     rows = []
-    for start, end in strict_windows(n_rounds):
-        rys = evaluate(model, loader, device, window=(start, end))["valid_board_rate"]
+    for start, end in log_rys_progress(strict_windows(n_rounds), device=device, depth=n_rounds):
+        rys = evaluate(model, cached, device, window=(start, end))["valid_board_rate"]
         mat[start, end] = rys - base
         rows.append({"start": start, "end": end, "baseline": base, "rys": rys, "delta_valid": rys - base})
     return pd.DataFrame(mat), base, pd.DataFrame(rows)

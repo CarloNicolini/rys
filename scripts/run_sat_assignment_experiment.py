@@ -26,7 +26,9 @@ from rys.tiny_transformer import (
     FactorizedAssignmentTransformerConfig,
     FactorizedCNFAssignmentTransformer,
 )
+from rys.training.device_cache import cache_batches_on_device
 from rys.training.modules import AssignmentLitModule
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
@@ -385,13 +387,14 @@ def delta_matrices(
     n_layers: int,
     n_repeats: int,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, float], pd.DataFrame]:
-    baseline = evaluate(model, loader, device)
+    cached = cache_batches_on_device(loader, device)
+    baseline = evaluate(model, cached, device)
     exact_matrix = np.full((n_layers, n_layers), np.nan, dtype=float)
     bit_matrix = np.full((n_layers, n_layers), np.nan, dtype=float)
     valid_matrix = np.full((n_layers, n_layers), np.nan, dtype=float)
     rows = []
-    for start, end in strict_upper_windows(n_layers):
-        metrics = evaluate(model, loader, device, rys_window=(start, end), n_repeats=n_repeats)
+    for start, end in log_rys_progress(strict_upper_windows(n_layers), device=device, depth=n_layers):
+        metrics = evaluate(model, cached, device, rys_window=(start, end), n_repeats=n_repeats)
         delta_exact = metrics["exact_match"] - baseline["exact_match"]
         delta_bit = metrics["bit_accuracy"] - baseline["bit_accuracy"]
         delta_valid = metrics["valid_assignment_rate"] - baseline["valid_assignment_rate"]

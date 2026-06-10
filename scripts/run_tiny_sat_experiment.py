@@ -32,7 +32,9 @@ from rys.tiny_transformer import (
     TinySatTransformer,
     TinyTransformerConfig,
 )
+from rys.training.device_cache import cache_batches_on_device
 from rys.training.modules import ClassifierLitModule
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
@@ -400,12 +402,15 @@ def _run(args: argparse.Namespace) -> None:
         for row in window_scores.head(args.top_k_windows).itertuples(index=False)
     ]
 
+    cached_eval = {
+        split: cache_batches_on_device(loaders[split], device) for split in ("val", "test", "ood")
+    }
     rys_rows = []
-    for window in selected:
+    for window in log_rys_progress(selected, device=device, n_layers=args.n_layers):
         for n_repeats in range(2, args.max_repeat + 1):
             val = evaluate(
                 model,
-                loaders["val"],
+                cached_eval["val"],
                 device,
                 architecture=args.architecture,
                 window=window,
@@ -413,7 +418,7 @@ def _run(args: argparse.Namespace) -> None:
             )
             test = evaluate(
                 model,
-                loaders["test"],
+                cached_eval["test"],
                 device,
                 architecture=args.architecture,
                 window=window,
@@ -421,7 +426,7 @@ def _run(args: argparse.Namespace) -> None:
             )
             ood = evaluate(
                 model,
-                loaders["ood"],
+                cached_eval["ood"],
                 device,
                 architecture=args.architecture,
                 window=window,
@@ -438,7 +443,7 @@ def _run(args: argparse.Namespace) -> None:
                     "val_loss": val["loss"],
                     "kl_base_to_rys": base_to_rys_kl(
                         model,
-                        loaders["val"],
+                        cached_eval["val"],
                         device,
                         architecture=args.architecture,
                         window=window,

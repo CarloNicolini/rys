@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
@@ -170,6 +171,44 @@ def test_sorted_translation_lightning_multi_loader_fit(tmp_path: Path) -> None:
     )
     trainer.fit(lit, train_dataloaders=train_loaders, val_dataloaders=val_loader)
     assert best_checkpoint_path(trainer).exists()
+
+
+def test_cache_batches_on_device_preserves_values() -> None:
+    from rys.training.device_cache import cache_batches_on_device
+
+    device = torch.device("cpu")
+    loader = DataLoader(
+        SatAssignmentDataset(
+            make_sat_assignment_examples(8, n_vars=4, n_clauses=10, seed=0), max_vars=4, max_clauses=10
+        ),
+        batch_size=4,
+    )
+    cached = cache_batches_on_device(loader, device)
+    originals = list(loader)
+    assert len(cached) == len(originals)
+    for cached_batch, original in zip(cached, originals):
+        for key, value in original.items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(cached_batch[key], value.to(device))
+                # The cached tensor is already resident, so .to(device) is a no-op.
+                assert cached_batch[key].to(device) is cached_batch[key]
+            else:
+                assert cached_batch[key] == value
+
+
+def test_log_rys_progress_yields_all_windows(capsys) -> None:
+    from rys.training.rys_logging import log_rys_progress
+
+    windows = [(i, i + 1) for i in range(5)]
+    seen = list(log_rys_progress(windows, device="cpu", depth=5))
+    assert seen == windows
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    events = [line["event"] for line in lines]
+    assert events[0] == "start"
+    assert events[-1] == "done"
+    assert lines[0]["device"] == "cpu"
+    assert lines[0]["n_windows"] == 5
+    assert all(line["depth"] == 5 for line in lines)
 
 
 def test_resolve_training_checkpoint_falls_back_to_disk(tmp_path: Path) -> None:

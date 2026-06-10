@@ -25,7 +25,9 @@ from rys.tiny_transformer import (
     TinySatTransformer,
     TinyTransformerConfig,
 )
+from rys.training.device_cache import cache_batches_on_device
 from rys.training.modules import ClassifierLitModule
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_model
 
 
@@ -352,13 +354,14 @@ def delta_accuracy_matrix(
     n_layers: int,
     n_repeats: int,
 ) -> tuple[pd.DataFrame, dict[str, float], pd.DataFrame]:
-    baseline = evaluate(model, loader, device, architecture=architecture)
+    cached = cache_batches_on_device(loader, device)
+    baseline = evaluate(model, cached, device, architecture=architecture)
     matrix = np.full((n_layers, n_layers), np.nan, dtype=float)
     rows = []
-    for start, end in strict_upper_windows(n_layers):
+    for start, end in log_rys_progress(strict_upper_windows(n_layers), device=device, depth=n_layers):
         metrics = evaluate(
             model,
-            loader,
+            cached,
             device,
             architecture=architecture,
             rys_window=(start, end),

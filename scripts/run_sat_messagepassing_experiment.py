@@ -40,6 +40,8 @@ from rys.sat_data import (
 _DEFAULT_RANDSAT_ROOT = Path("~/workspace/RandSATBench/datasets/3SAT").expanduser()
 from rys.sat_message_passing import MessagePassingConfig, MessagePassingSatModel
 from rys.training.modules import SatMPLitModule
+from rys.training.device_cache import cache_batches_on_device
+from rys.training.rys_logging import log_rys_progress
 from rys.training.trainer import build_trainer, load_rys_model, resolve_training_checkpoint
 
 
@@ -489,11 +491,12 @@ def delta_matrices(
     n_layers: int,
     n_repeats: int,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, float], pd.DataFrame]:
-    baseline = evaluate(model, loader, device)
+    cached = cache_batches_on_device(loader, device)
+    baseline = evaluate(model, cached, device)
     matrices = {key: np.full((n_layers, n_layers), np.nan) for key in ("valid_assignment_rate", "bit_accuracy", "exact_match")}
     rows = []
-    for start, end in strict_upper_windows(n_layers):
-        metrics = evaluate(model, loader, device, rys_window=(start, end), n_repeats=n_repeats)
+    for start, end in log_rys_progress(strict_upper_windows(n_layers), device=device, depth=n_layers):
+        metrics = evaluate(model, cached, device, rys_window=(start, end), n_repeats=n_repeats)
         for key in matrices:
             matrices[key][start, end] = metrics[key] - baseline[key]
         rows.append(
