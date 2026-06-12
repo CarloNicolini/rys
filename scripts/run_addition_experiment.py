@@ -46,10 +46,10 @@ from rys.training.trainer import best_checkpoint_path, build_trainer, load_rys_m
 
 def main(
     seed: int = typer.Option(0, help="Random seed."),
-    train_ns: str = typer.Option("1,2,3,4,5,6,7,8", help="Comma list of training operand counts (dense, on-the-fly)."),
+    train_ns: str = typer.Option("2,3,4,5,6,7,8", help="Comma list of training operand counts (dense, on-the-fly)."),
     ood_ns: str = typer.Option("10,12,16", help="Comma list of out-of-distribution operand counts."),
-    val_ns: str = typer.Option("1,2,3,4,5,6,7,8", help="Comma list of in-distribution validation operand counts (stratified)."),
-    test_ns: str = typer.Option("1,2,3,4,5,6,7,8", help="Comma list of in-distribution test operand counts (stratified)."),
+    val_ns: str = typer.Option("2,3,4,5,6,7,8", help="Comma list of in-distribution validation operand counts (stratified)."),
+    test_ns: str = typer.Option("2,3,4,5,6,7,8", help="Comma list of in-distribution test operand counts (stratified)."),
     digits: int = typer.Option(3, help="Digits per operand."),
     answer_width: int = typer.Option(6, help="Number of answer-slot tokens (max sum width)."),
     n_train: int = typer.Option(8192, help="Training samples PER EPOCH (split evenly across train-ns, resampled on-the-fly)."),
@@ -84,6 +84,14 @@ def main(
         True,
         "--deep-supervision/--no-deep-supervision",
         help="Supervise the answer readout after every layer (iterative-solver objective).",
+    ),
+    curriculum: bool = typer.Option(
+        True,
+        "--curriculum/--no-curriculum",
+        help="Start training on the smallest operand count and add one larger n every --curriculum-epochs (cumulative).",
+    ),
+    curriculum_epochs: int = typer.Option(
+        15, help="Epochs to train before introducing the next-larger operand count."
     ),
     max_repeat: int = typer.Option(6, help="Maximum total traversals of a window in the RYS sweep."),
     skip_rys: bool = typer.Option(
@@ -136,7 +144,7 @@ def make_loaders(
     ordered list of all eval split names, the training operand counts, and the
     subset of split names used for in-distribution validation.
     """
-    train_ns = parse_ns(args.train_ns)
+    train_ns = sorted(parse_ns(args.train_ns))
     val_ns = parse_ns(args.val_ns)
     test_ns = parse_ns(args.test_ns)
     ood_ns = parse_ns(args.ood_ns)
@@ -186,6 +194,49 @@ def make_loaders(
         add_eval(f"ood_n{n_operands}", examples)
 
     return train_loaders, eval_loaders, eval_splits, train_ns, val_split_names
+
+
+class AdditionDataModule(L.LightningDataModule):
+    """Serve training loaders with an optional cumulative operand-count curriculum.
+
+    ``train_loaders`` are ordered by ascending ``n``. With ``curriculum`` enabled,
+    epoch ``e`` trains on the first ``e // curriculum_epochs + 1`` operand counts
+    (so the model first masters small ``n`` and then fine-tunes on each larger one
+    in turn, keeping the easier counts to avoid forgetting). Requires the trainer
+    to reload dataloaders every epoch. Validation always covers every operand
+    count so the per-``n`` metrics stay comparable across the curriculum.
+    """
+
+    def __init__(
+        self,
+        train_loaders: list[DataLoader],
+        train_ns: list[int],
+        val_loader: CombinedLoader,
+        *,
+        curriculum: bool,
+        curriculum_epochs: int,
+    ) -> None:
+        super().__init__()
+        self.train_loaders = train_loaders
+        self.train_ns = train_ns
+        self.val_loader = val_loader
+        self.curriculum = curriculum
+        self.curriculum_epochs = max(1, curriculum_epochs)
+
+    def active_count(self, epoch: int) -> int:
+        if not self.curriculum:
+            return len(self.train_loaders)
+        return min(epoch // self.curriculum_epochs + 1, len(self.train_loaders))
+
+    def train_dataloader(self) -> list[DataLoader]:
+        epoch = self.trainer.current_epoch if self.trainer is not None else 0
+        k = self.active_count(epoch)
+        if self.curriculum:
+            print(json.dumps({"epoch": epoch, "curriculum_active_ns": self.train_ns[:k]}))
+        return self.train_loaders[:k]
+
+    def val_dataloader(self) -> CombinedLoader:
+        return self.val_loader
 
 
 def build_model(args: argparse.Namespace) -> tuple[AdditionTransformer, dict]:
@@ -507,6 +558,7 @@ def _run(args: argparse.Namespace) -> None:
             max_epochs=args.epochs,
             monitor=lit.primary_metric,
             mode=lit.primary_mode,
+            reload_dataloaders_every_n_epochs=1 if args.curriculum else 0,
         )
         # Combine the per-n validation loaders into a single dict-batch loader so
         # one validation step covers every operand count and the LitModule can log
@@ -514,7 +566,14 @@ def _run(args: argparse.Namespace) -> None:
         val_loader = CombinedLoader(
             {name: loaders[name] for name in val_split_names}, mode="max_size_cycle"
         )
-        trainer.fit(lit, train_dataloaders=train_loaders, val_dataloaders=val_loader)
+        datamodule = AdditionDataModule(
+            train_loaders,
+            train_ns,
+            val_loader,
+            curriculum=args.curriculum,
+            curriculum_epochs=args.curriculum_epochs,
+        )
+        trainer.fit(lit, datamodule=datamodule)
         checkpoint_path = best_checkpoint_path(trainer)
 
     reloaded, _ = load_rys_model(

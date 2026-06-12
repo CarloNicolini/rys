@@ -22,6 +22,7 @@ def build_trainer(
     mode: str = "max",
     extra_log_fields: dict[str, Any] | None = None,
     enable_progress_bar: bool = True,
+    reload_dataloaders_every_n_epochs: int = 0,
 ) -> L.Trainer:
     """Return the standard RYS Lightning Trainer."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +53,7 @@ def build_trainer(
         num_sanity_val_steps=0,
         log_every_n_steps=1,
         enable_progress_bar=enable_progress_bar,
+        reload_dataloaders_every_n_epochs=reload_dataloaders_every_n_epochs,
     )
 
 
