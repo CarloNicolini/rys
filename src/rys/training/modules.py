@@ -389,6 +389,24 @@ class AdditionLitModule(RysLitModule):
     primary_metric = "exact_accuracy"
     primary_mode = "max"
 
+    def __init__(
+        self,
+        net,
+        *,
+        lr: float,
+        weight_decay: float,
+        deep_supervision: bool = True,
+        model_config=None,
+    ) -> None:
+        super().__init__(
+            net,
+            lr=lr,
+            weight_decay=weight_decay,
+            model_config=model_config,
+            extra_hparams={"deep_supervision": deep_supervision},
+        )
+        self.deep_supervision = deep_supervision
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -421,9 +439,25 @@ class AdditionLitModule(RysLitModule):
 
     def _single_step(self, batch):
         target_ids = batch["target_ids"]
-        out = self.net(batch["input_ids"], target_ids=target_ids)
-        loss = out["loss"]
+        out = self.net(
+            batch["input_ids"], target_ids=target_ids, return_round_logits=self.deep_supervision
+        )
         answer_width = target_ids.shape[1]
+        round_logits = out["round_logits"] or []
+        if self.deep_supervision and round_logits:
+            # Supervise the answer-slot readout after every layer (one refinement
+            # round each), so depth behaves like an iterative solver.
+            n_classes = round_logits[0].shape[-1]
+            loss = torch.stack(
+                [
+                    F.cross_entropy(
+                        rl[:, -answer_width:, :].reshape(-1, n_classes), target_ids.reshape(-1)
+                    )
+                    for rl in round_logits
+                ]
+            ).mean()
+        else:
+            loss = out["loss"]
         preds = out["logits"][:, -answer_width:, :].argmax(dim=-1)
         digit_accuracy = (preds == target_ids).float().mean()
         exact_accuracy = verify_addition_tensor(preds, batch["answer"]).float().mean()

@@ -52,6 +52,8 @@ class AdditionConfig:
     pre_norm: bool = True
     weight_tied: bool = False
     rope_base: float = 10000.0
+    use_rope: bool = True
+    causal: bool = False
 
 
 class AdditionBackbone(nn.Module):

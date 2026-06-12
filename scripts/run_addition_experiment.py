@@ -68,6 +68,19 @@ def main(
         False, "--weight-tied/--no-weight-tied", help="Share one round across depth (iterated map)."
     ),
     pre_norm: bool = typer.Option(True, "--pre-norm/--post-norm", help="Pre-norm (additive residual) vs post-norm."),
+    nope: bool = typer.Option(
+        True, "--nope/--rope", help="NoPE (no positional encoding) vs RoPE. The paper uses NoPE."
+    ),
+    causal: bool = typer.Option(
+        True,
+        "--causal/--bidirectional",
+        help="Causal (decoder-only) attention. Required for NoPE to break permutation symmetry.",
+    ),
+    deep_supervision: bool = typer.Option(
+        True,
+        "--deep-supervision/--no-deep-supervision",
+        help="Supervise the answer readout after every layer (iterative-solver objective).",
+    ),
     max_repeat: int = typer.Option(6, help="Maximum total traversals of a window in the RYS sweep."),
     skip_rys: bool = typer.Option(
         False, "--skip-rys/--no-skip-rys", help="Skip the RYS sweep (Phase 1: just check decent performance)."
@@ -180,6 +193,8 @@ def build_model(args: argparse.Namespace) -> tuple[AdditionTransformer, dict]:
         dropout=args.dropout,
         pre_norm=args.pre_norm,
         weight_tied=args.weight_tied,
+        use_rope=not args.nope,
+        causal=args.causal,
     )
     return AdditionTransformer(config), config.__dict__
 
@@ -478,6 +493,7 @@ def _run(args: argparse.Namespace) -> None:
             model,
             lr=args.lr,
             weight_decay=args.weight_decay,
+            deep_supervision=args.deep_supervision,
             model_config=config,
         )
         trainer = build_trainer(

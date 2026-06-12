@@ -87,7 +87,12 @@ class RoPESelfAttentionRound(nn.Module):
         self.head_dim = d // config.n_heads
         if self.head_dim * config.n_heads != d:
             raise ValueError("d_model must be divisible by n_heads.")
-        if self.head_dim % 2 != 0:
+        # NoPE (no positional encoding) and causal masking are opt-in via config;
+        # defaults keep the original bidirectional-RoPE behaviour for callers
+        # whose config predates these fields.
+        self.use_rope = getattr(config, "use_rope", True)
+        self.causal = getattr(config, "causal", False)
+        if self.use_rope and self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE.")
         self.rope_base = config.rope_base
         self.attn_norm = nn.LayerNorm(d)
@@ -110,10 +115,14 @@ class RoPESelfAttentionRound(nn.Module):
         q = self.q(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v(x).view(b, s, self.n_heads, self.head_dim).transpose(1, 2)
-        cos, sin = _build_rope_cache(s, self.head_dim, base=self.rope_base, device=h.device, dtype=h.dtype)
-        q = _apply_rope(q, cos, sin)
-        k = _apply_rope(k, cos, sin)
+        if self.use_rope:
+            cos, sin = _build_rope_cache(s, self.head_dim, base=self.rope_base, device=h.device, dtype=h.dtype)
+            q = _apply_rope(q, cos, sin)
+            k = _apply_rope(k, cos, sin)
         scores = (q @ k.transpose(-1, -2)) / (self.head_dim ** 0.5)  # (B, H, S, S)
+        if self.causal:
+            causal_mask = torch.ones(s, s, device=scores.device, dtype=torch.bool).triu(1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
         attn = self.attn_dropout(scores.softmax(dim=-1))
         ctx = attn @ v  # (B, H, S, head_dim)
         ctx = ctx.transpose(1, 2).reshape(b, s, d)
