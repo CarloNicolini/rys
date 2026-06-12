@@ -58,6 +58,10 @@ def main(
     batch_size: int = typer.Option(128, help="Batch size."),
     epochs: int = typer.Option(200, help="Training epochs (also the cosine schedule horizon)."),
     lr: float = typer.Option(1e-4, help="AdamW peak learning rate (cosine-decayed to 0)."),
+    warmup_epochs: int = typer.Option(0, help="Linear LR warmup epochs before cosine decay (0 disables)."),
+    loss_weighting: str = typer.Option(
+        "none", help="Per-n training loss weighting: 'none' or 'linear' (weight proportional to operand count)."
+    ),
     weight_decay: float = typer.Option(0.0, help="AdamW weight decay."),
     d_model: int = typer.Option(512, help="Model width (must be divisible by n-heads)."),
     n_layers: int = typer.Option(6, help="Number of transformer layers."),
@@ -494,6 +498,8 @@ def _run(args: argparse.Namespace) -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             deep_supervision=args.deep_supervision,
+            warmup_epochs=args.warmup_epochs,
+            loss_weighting=args.loss_weighting,
             model_config=config,
         )
         trainer = build_trainer(

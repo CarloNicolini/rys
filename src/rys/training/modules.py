@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from rys.addition_data import verify_addition_tensor
+from rys.addition_data import EQ, PLUS, verify_addition_tensor
 from rys.coloring_data import soft_coloring_loss, verify_coloring_tensor
 from rys.nqueens_data import soft_nqueens_loss, verify_boards_tensor
 from rys.sat_data import soft_sat_loss, verify_assignment_tensor
@@ -396,6 +396,8 @@ class AdditionLitModule(RysLitModule):
         lr: float,
         weight_decay: float,
         deep_supervision: bool = True,
+        warmup_epochs: int = 0,
+        loss_weighting: str = "none",
         model_config=None,
     ) -> None:
         super().__init__(
@@ -403,16 +405,51 @@ class AdditionLitModule(RysLitModule):
             lr=lr,
             weight_decay=weight_decay,
             model_config=model_config,
-            extra_hparams={"deep_supervision": deep_supervision},
+            extra_hparams={
+                "deep_supervision": deep_supervision,
+                "warmup_epochs": warmup_epochs,
+                "loss_weighting": loss_weighting,
+            },
         )
         self.deep_supervision = deep_supervision
+        self.warmup_epochs = warmup_epochs
+        self.loss_weighting = loss_weighting
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.trainer.max_epochs, eta_min=0.0
-        )
+        max_epochs = self.trainer.max_epochs
+        if self.warmup_epochs > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.warmup_epochs
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, max_epochs - self.warmup_epochs), eta_min=0.0
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup, cosine], milestones=[self.warmup_epochs]
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max_epochs, eta_min=0.0
+            )
         return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+    def _weighted_mean(self, losses: torch.Tensor, items) -> torch.Tensor:
+        """Mean over per-n training items, optionally weighted by operand count.
+
+        ``loss_weighting="linear"`` scales each item's loss by its operand count
+        ``n`` (read off the input separators), normalised to keep the overall
+        scale unchanged, so harder large-``n`` columns get a larger share of the
+        gradient than the trivial ``n=1`` copy task.
+        """
+        if self.loss_weighting == "none":
+            return losses.mean()
+        counts = torch.tensor(
+            [float(((it["input_ids"] == PLUS) | (it["input_ids"] == EQ)).sum(dim=1)[0]) for it in items],
+            device=losses.device,
+        )
+        weights = counts / counts.mean().clamp_min(1.0)
+        return (losses * weights).mean()
 
     def _shared_step(self, batch, stage):
         if isinstance(batch, list | tuple):
@@ -422,7 +459,8 @@ class AdditionLitModule(RysLitModule):
                 key: torch.stack([item_metrics[key] for _, item_metrics in outputs]).mean()
                 for key in outputs[0][1]
             }
-            return losses.mean(), metrics
+            loss = self._weighted_mean(losses, batch) if stage == "train" else losses.mean()
+            return loss, metrics
         if "input_ids" not in batch:
             named = {name: self._single_step(item) for name, item in batch.items()}
             losses = torch.stack([loss for loss, _ in named.values()])
@@ -434,7 +472,12 @@ class AdditionLitModule(RysLitModule):
             for name, (_, m) in named.items():
                 metrics[f"exact_accuracy_{name}"] = m["exact_accuracy"]
                 metrics[f"digit_accuracy_{name}"] = m["digit_accuracy"]
-            return losses.mean(), metrics
+            loss = (
+                self._weighted_mean(losses, list(batch.values()))
+                if stage == "train"
+                else losses.mean()
+            )
+            return loss, metrics
         return self._single_step(batch)
 
     def _single_step(self, batch):
