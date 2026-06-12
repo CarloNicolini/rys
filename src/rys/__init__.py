@@ -4,6 +4,19 @@ Public re-exports for convenience inside the notebook.
 """
 
 from rys.activations import capture_generated_residual_stream, capture_residual_stream
+from rys.addition_data import (
+    AdditionDataset,
+    AdditionExample,
+    digits_to_int,
+    make_addition_examples,
+    make_addition_splits,
+    verify_addition_tensor,
+)
+from rys.addition_transformer import (
+    AdditionBackbone,
+    AdditionConfig,
+    AdditionTransformer,
+)
 from rys.analytical_fk import (
     FkPrior,
     compare_prior_to_empirical,
@@ -118,6 +131,15 @@ from rys.tiny_transformer import (
 )
 
 __all__ = [
+    "AdditionBackbone",
+    "AdditionConfig",
+    "AdditionDataset",
+    "AdditionExample",
+    "AdditionTransformer",
+    "digits_to_int",
+    "make_addition_examples",
+    "make_addition_splits",
+    "verify_addition_tensor",
     "FkPrior",
     "ClauseAssignmentDataset",
     "NBucketBatchSampler",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from rys.addition_data import verify_addition_tensor
 from rys.coloring_data import soft_coloring_loss, verify_coloring_tensor
 from rys.nqueens_data import soft_nqueens_loss, verify_boards_tensor
 from rys.sat_data import soft_sat_loss, verify_assignment_tensor
@@ -376,6 +377,59 @@ class SortedTranslationLitModule(RysLitModule):
             "token_accuracy": token_accuracy,
             "sequence_accuracy": sequence_accuracy,
             "sortedness": sortedness(preds).mean(),
+        }
+        if hasattr(self.net, "model") and hasattr(self.net.model, "embed"):
+            metrics["w_e_norm"] = self.net.model.embed.weight.norm().detach()
+        if hasattr(self.net, "unembed"):
+            metrics["w_u_norm"] = self.net.unembed.weight.norm().detach()
+        return loss, metrics
+
+
+class AdditionLitModule(RysLitModule):
+    primary_metric = "exact_accuracy"
+    primary_mode = "max"
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.trainer.max_epochs, eta_min=0.0
+        )
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+    def _shared_step(self, batch, stage):
+        if isinstance(batch, list | tuple):
+            outputs = [self._single_step(item) for item in batch]
+            losses = torch.stack([loss for loss, _ in outputs])
+            metrics = {
+                key: torch.stack([item_metrics[key] for _, item_metrics in outputs]).mean()
+                for key in outputs[0][1]
+            }
+            return losses.mean(), metrics
+        if "input_ids" not in batch:
+            named = {name: self._single_step(item) for name, item in batch.items()}
+            losses = torch.stack([loss for loss, _ in named.values()])
+            keys = next(iter(named.values()))[1]
+            metrics = {
+                key: torch.stack([m[key] for _, m in named.values()]).mean() for key in keys
+            }
+            # Per-split (per-n) breakdown so each operand count is visible in the logs.
+            for name, (_, m) in named.items():
+                metrics[f"exact_accuracy_{name}"] = m["exact_accuracy"]
+                metrics[f"digit_accuracy_{name}"] = m["digit_accuracy"]
+            return losses.mean(), metrics
+        return self._single_step(batch)
+
+    def _single_step(self, batch):
+        target_ids = batch["target_ids"]
+        out = self.net(batch["input_ids"], target_ids=target_ids)
+        loss = out["loss"]
+        answer_width = target_ids.shape[1]
+        preds = out["logits"][:, -answer_width:, :].argmax(dim=-1)
+        digit_accuracy = (preds == target_ids).float().mean()
+        exact_accuracy = verify_addition_tensor(preds, batch["answer"]).float().mean()
+        metrics = {
+            "digit_accuracy": digit_accuracy,
+            "exact_accuracy": exact_accuracy,
         }
         if hasattr(self.net, "model") and hasattr(self.net.model, "embed"):
             metrics["w_e_norm"] = self.net.model.embed.weight.norm().detach()
