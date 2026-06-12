@@ -56,6 +56,10 @@ def main(
     n_val: int = typer.Option(512, help="Validation examples (per operand count)."),
     n_test: int = typer.Option(512, help="Test/OOD examples (per operand count)."),
     batch_size: int = typer.Option(128, help="Batch size."),
+    num_workers: int = typer.Option(
+        4,
+        help="DataLoader worker processes for validation/eval loaders (training streams stay at 0).",
+    ),
     epochs: int = typer.Option(200, help="Training epochs (also the cosine schedule horizon)."),
     lr: float = typer.Option(1e-4, help="AdamW peak learning rate (cosine-decayed to 0)."),
     warmup_epochs: int = typer.Option(0, help="Linear LR warmup epochs before cosine decay (0 disables)."),
@@ -128,6 +132,13 @@ def parse_ns(value: str) -> list[int]:
     return ns
 
 
+def _eval_loader_kwargs(args: argparse.Namespace) -> dict:
+    kwargs: dict = {"num_workers": args.num_workers}
+    if args.num_workers > 0:
+        kwargs["persistent_workers"] = True
+    return kwargs
+
+
 def make_loaders(
     args: argparse.Namespace,
 ) -> tuple[list[DataLoader], dict[str, DataLoader], list[str], list[int], list[str]]:
@@ -167,7 +178,10 @@ def make_loaders(
 
     def add_eval(name: str, examples: list) -> None:
         eval_loaders[name] = DataLoader(
-            AdditionDataset(examples), batch_size=args.batch_size, shuffle=False
+            AdditionDataset(examples),
+            batch_size=args.batch_size,
+            shuffle=False,
+            **_eval_loader_kwargs(args),
         )
         eval_splits.append(name)
 
