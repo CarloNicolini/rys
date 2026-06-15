@@ -144,7 +144,10 @@ def compute_cka(
         max_length=max_length,
         device=device,
     )
-    cka = cka_matrix(activations, unbiased=False, device="cpu")
+    # CKA is O(L^2 * N^2); run it on the model device (GPU) so the many-layer
+    # connectome of the larger models stays cheap.
+    cka_device = device if device.type == "cuda" else "cpu"
+    cka = cka_matrix(activations, unbiased=False, device=cka_device)
     return cka, activations
 
 
