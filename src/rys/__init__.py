@@ -46,6 +46,14 @@ from rys.coloring_message_passing import (
     ColoringRound,
 )
 from rys.data import csqa_prompts, gsm8k_prompts, mmlu_prompts
+from rys.gsm8k_mc import (
+    build_distractors,
+    load_pythia,
+    make_gsm8k_mc,
+    mc_accuracy,
+    parse_gold,
+    score_mc,
+)
 from rys.modules import change_points, leiden_communities, plateau_metric
 from rys.nqueens_data import (
     QueensDataset,
@@ -207,6 +215,12 @@ __all__ = [
     "csqa_prompts",
     "delta_heatmap",
     "assignment_satisfies_formula",
+    "build_distractors",
+    "load_pythia",
+    "make_gsm8k_mc",
+    "mc_accuracy",
+    "parse_gold",
+    "score_mc",
     "encode_clause_tensor",
     "encode_formula",
     "encode_formula_assignment_factorized",
