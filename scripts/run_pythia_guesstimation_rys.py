@@ -38,7 +38,6 @@ from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
 from rys.gsm8k_mc import load_pythia
 from rys.guesstimation import generate_numbers, make_guesstimation_questions, score_estimates
-from rys.surgery import apply_rys
 from rys.theory_validation import rho_phi_table, theory_fit
 
 
@@ -122,9 +121,10 @@ def _run(args: argparse.Namespace) -> None:
     n_q = len(questions)
     print(f"{tag}: L={L}, {n_q} guesstimation questions", flush=True)
 
-    def probe() -> np.ndarray:
+    def probe(window=None) -> np.ndarray:
         ests = generate_numbers(
-            model, tok, questions, device=device, batch_size=args.batch_size, max_new_tokens=args.max_new_tokens
+            model, tok, questions, device=device, batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens, window=window,
         )
         return score_estimates(questions, ests)
 
@@ -134,8 +134,7 @@ def _run(args: argparse.Namespace) -> None:
     windows = swept_windows(L, stride=args.stride)
     per_q = np.zeros((len(windows), n_q), dtype=float)
     for w, (i, j) in enumerate(windows):
-        with apply_rys(model, (i, j), n_repeats=2):
-            per_q[w] = probe()
+        per_q[w] = probe(window=(i, j))
         if (w + 1) % 25 == 0:
             print(f"  {w + 1}/{len(windows)} windows", flush=True)
 

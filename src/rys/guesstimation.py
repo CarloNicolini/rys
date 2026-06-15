@@ -23,8 +23,11 @@ hook stays exact (re-running layers would otherwise corrupt the KV cache).
 
 from __future__ import annotations
 
+import copy
 import random
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -98,6 +101,67 @@ def make_guesstimation_questions(seed: int = 0) -> list[dict]:
     return [{"question": q, "answer": int(ans)} for q, ans in items]
 
 
+def _clone_layer_shared(layer: torch.nn.Module, new_idx: int) -> torch.nn.Module:
+    """A layer copy that shares weight tensors but has its own cache index.
+
+    ``copy.copy`` shallow-copies the instance ``__dict__`` but leaves the
+    ``_modules``/``_parameters``/``_buffers`` *dicts* shared with the original, so
+    mutating the copy would corrupt the source. We give the copy fresh container
+    dicts (same tensor values) and a distinct ``layer_idx`` so each occurrence in
+    the unrolled path gets its own KV-cache slot, with no extra GPU memory.
+    """
+    new_layer = copy.copy(layer)
+    new_layer._parameters = dict(layer._parameters)
+    new_layer._buffers = dict(layer._buffers)
+    new_layer._modules = dict(layer._modules)
+    new_attn = copy.copy(layer.attention)
+    new_attn._parameters = dict(layer.attention._parameters)
+    new_attn._buffers = dict(layer.attention._buffers)
+    new_attn._modules = dict(layer.attention._modules)
+    new_attn.layer_idx = new_idx
+    new_layer._modules["attention"] = new_attn
+    if "layer_idx" in new_layer.__dict__:
+        new_layer.layer_idx = new_idx
+    return new_layer
+
+
+@contextmanager
+def rys_unrolled(model: torch.nn.Module, window: tuple[int, int] | None) -> Iterator[None]:
+    """Temporarily rebuild ``model.model.layers`` as the unrolled RYS path.
+
+    The half-open RYS window ``(i, j)`` is realised by the layer sequence
+    ``[0..j-1, i..j-1, j..L-1]``. Unlike the forward-pre-hook in
+    :func:`rys.surgery.apply_rys`, each replayed layer here is a distinct module
+    (a shallow copy that *shares the weight tensors*, so no extra memory) with a
+    corrected cache index, which lets generation run with the normal KV cache —
+    roughly an order of magnitude faster than ``use_cache=False`` replay. The
+    computation is identical to ``apply_rys`` with ``n_repeats=2``.
+
+    ``window=None`` is a no-op (baseline model).
+    """
+    if window is None:
+        yield
+        return
+    start, end = window
+    base = model.model.layers
+    L = len(base)
+    if not (0 <= start < end <= L):
+        raise ValueError(f"Bad window {window} for L={L}.")
+
+    path = list(range(0, end)) + list(range(start, end)) + list(range(end, L))
+    unrolled = [_clone_layer_shared(base[k], new_idx) for new_idx, k in enumerate(path)]
+
+    orig_layers = model.model.layers
+    orig_n = model.config.num_hidden_layers
+    model.model.layers = torch.nn.ModuleList(unrolled)
+    model.config.num_hidden_layers = len(unrolled)
+    try:
+        yield
+    finally:
+        model.model.layers = orig_layers
+        model.config.num_hidden_layers = orig_n
+
+
 _NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
@@ -120,11 +184,12 @@ def generate_numbers(
     device: str | torch.device | None = None,
     batch_size: int = 32,
     max_new_tokens: int = 12,
+    window: tuple[int, int] | None = None,
 ) -> list[float | None]:
     """Greedily generate the answer for each question and parse the number.
 
-    ``use_cache=False`` keeps the RYS replay exact when wrapped in
-    :func:`rys.surgery.apply_rys`.
+    When ``window`` is given the model is temporarily unrolled into the RYS path
+    (:func:`rys_unrolled`), so generation can use the KV cache and remain exact.
     """
     device = device or next(model.parameters()).device
     pad_id = tokenizer.pad_token_id
@@ -132,21 +197,21 @@ def generate_numbers(
 
     estimates: list[float | None] = []
     model.eval()
-    for start in range(0, len(prompts), batch_size):
-        batch = prompts[start : start + batch_size]
-        enc = tokenizer(batch, return_tensors="pt", padding=True).to(device)
-        out = model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=False,
-            pad_token_id=pad_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-        for row in range(len(batch)):
-            new_tokens = out[row, enc["input_ids"].shape[1] :]
-            text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-            estimates.append(parse_number(text))
+    with rys_unrolled(model, window):
+        for start in range(0, len(prompts), batch_size):
+            batch = prompts[start : start + batch_size]
+            enc = tokenizer(batch, return_tensors="pt", padding=True).to(device)
+            out = model.generate(
+                **enc,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            for row in range(len(batch)):
+                new_tokens = out[row, enc["input_ids"].shape[1] :]
+                text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+                estimates.append(parse_number(text))
     return estimates
 
 
@@ -165,9 +230,14 @@ def probe_score(
     device: str | torch.device | None = None,
     batch_size: int = 32,
     max_new_tokens: int = 12,
+    window: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    """Run the generative probe and return per-question partial-credit scores."""
+    """Run the generative probe and return per-question partial-credit scores.
+
+    Pass ``window=(i, j)`` to score under the RYS intervention.
+    """
     estimates = generate_numbers(
-        model, tokenizer, questions, device=device, batch_size=batch_size, max_new_tokens=max_new_tokens
+        model, tokenizer, questions, device=device, batch_size=batch_size,
+        max_new_tokens=max_new_tokens, window=window,
     )
     return score_estimates(questions, estimates)
