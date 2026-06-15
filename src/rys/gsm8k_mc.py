@@ -166,9 +166,10 @@ def prepare_mc_batches(tokenizer, mc_df: pd.DataFrame, batch_size: int = 16) -> 
     RYS replay never changes the inputs, so for an RYS window sweep the
     tokenisation and padding should happen a single time and the resulting
     tensors be reused for every window (the per-window cost is then the forward
-    pass alone). Each batch is a dict with CPU tensors ``input_ids``,
-    ``attention_mask``, ``cont_mask`` (continuation-token positions) and a
-    ``meta`` list of ``(prompt_id, cand_idx, is_gold, n_tokens)``.
+    pass alone). Each batch is a dict with CPU tensors ``input_ids`` and
+    ``attention_mask`` plus a ``meta`` list of
+    ``(prompt_id, cand_idx, is_gold, n_tokens)``; continuation tokens are the
+    last ``n_tokens`` of each left-padded row.
     """
     pad_id = tokenizer.pad_token_id
     items = []  # (prompt_id, cand_idx, is_gold, input_ids, n_cont)
@@ -186,16 +187,12 @@ def prepare_mc_batches(tokenizer, mc_df: pd.DataFrame, batch_size: int = 16) -> 
         max_len = max(len(seq) for *_, seq, _ in chunk)
         input_ids = torch.full((len(chunk), max_len), pad_id, dtype=torch.long)
         attn = torch.zeros((len(chunk), max_len), dtype=torch.long)
-        cont_mask = torch.zeros((len(chunk), max_len), dtype=torch.bool)
         meta = []
         for r, (pid, cand_idx, is_gold, seq, n_cont) in enumerate(chunk):
             input_ids[r, max_len - len(seq) :] = torch.tensor(seq, dtype=torch.long)
             attn[r, max_len - len(seq) :] = 1
-            cont_mask[r, max_len - n_cont :] = True
             meta.append((pid, cand_idx, is_gold, n_cont))
-        batches.append(
-            {"input_ids": input_ids, "attention_mask": attn, "cont_mask": cont_mask, "meta": meta}
-        )
+        batches.append({"input_ids": input_ids, "attention_mask": attn, "meta": meta})
     return batches
 
 
@@ -216,17 +213,22 @@ def score_prepared(
     records = []
     for batch in batches:
         input_ids = batch["input_ids"].to(device)
+        seq_len = input_ids.shape[1]
         logits = model(
             input_ids=input_ids, attention_mask=batch["attention_mask"].to(device), use_cache=False
         ).logits
-        logprobs = torch.log_softmax(logits.float(), dim=-1)
-        # token at position t is predicted from logits at t-1
-        token_lp = torch.zeros_like(input_ids, dtype=torch.float32)
-        token_lp[:, 1:] = logprobs[:, :-1].gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-        token_lp = token_lp.cpu()
-        cont_mask = batch["cont_mask"]
+
+        # Continuations are the last `need` tokens (left padding), so only the
+        # final `need` logit positions matter. Softmaxing just that slice avoids
+        # materialising a (batch, seq, vocab) logprob tensor over the whole vocab.
+        need = max(int(n_cont) for *_, n_cont in batch["meta"])
+        pred = logits[:, seq_len - need - 1 : seq_len - 1, :]  # predicts the last `need` tokens
+        targets = input_ids[:, seq_len - need :]
+        tail_lp = torch.log_softmax(pred.float(), dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        tail_lp = tail_lp.cpu()  # (batch, need), column k is the k-th-from-last token
+
         for r, (pid, cand_idx, is_gold, n_cont) in enumerate(batch["meta"]):
-            total = float(token_lp[r][cont_mask[r]].sum())
+            total = float(tail_lp[r, need - n_cont :].sum())  # only this row's continuation tokens
             records.append(
                 {
                     "prompt_id": pid,
