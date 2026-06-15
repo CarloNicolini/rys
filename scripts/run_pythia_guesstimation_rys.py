@@ -49,6 +49,9 @@ def main(
     max_new_tokens: int = typer.Option(12, help="Generated tokens per answer."),
     capture_n: int = typer.Option(32, help="Prompts used for the CKA connectome."),
     capture_batch_size: int = typer.Option(8, help="Batch size for residual capture."),
+    stride: int = typer.Option(
+        1, help="Sweep windows on a layer stride (use 2 for very deep models to keep generation tractable)."
+    ),
     dtype: str = typer.Option(
         "float32",
         help="Weights precision: 'float32' (safe for small models; bf16 breaks their generation), "
@@ -69,8 +72,15 @@ def resolve_device() -> torch.device:
     return torch.device("cpu")
 
 
-def swept_windows(L: int) -> list[tuple[int, int]]:
-    return [(i, j) for i in range(L) for j in range(i + 1, L)]
+def swept_windows(L: int, stride: int = 1) -> list[tuple[int, int]]:
+    """Half-open windows ``(i, j)``, ``0<=i<j<L``, sampled on a layer stride.
+
+    The last layer ``L-1`` is always kept as a candidate ``j`` so deep models
+    still probe coda-crossing windows even under a coarse stride.
+    """
+    ends = sorted(set(range(0, L, stride)) | {L - 1})
+    starts = sorted(set(range(0, L, stride)))
+    return [(i, j) for i in starts for j in ends if i < j]
 
 
 def save_heatmap(matrix, path, *, title, cmap, cbar_label, diverging):
@@ -121,7 +131,7 @@ def _run(args: argparse.Namespace) -> None:
     base = probe()
     print(f"baseline score = {base.mean():.4f}", flush=True)
 
-    windows = swept_windows(L)
+    windows = swept_windows(L, stride=args.stride)
     per_q = np.zeros((len(windows), n_q), dtype=float)
     for w, (i, j) in enumerate(windows):
         with apply_rys(model, (i, j), n_repeats=2):
@@ -185,7 +195,7 @@ def _run(args: argparse.Namespace) -> None:
 
     summary = {
         "model": args.model, "L": L, "n_questions": n_q, "n_windows": len(windows),
-        "dtype": args.dtype,
+        "dtype": args.dtype, "stride": args.stride,
         "baseline_score": round(float(base.mean()), 4),
         "mean_delta": round(float(delta.mean()), 4),
         "best_delta": round(float(delta.max()), 4),
