@@ -49,7 +49,11 @@ def main(
     max_new_tokens: int = typer.Option(12, help="Generated tokens per answer."),
     capture_n: int = typer.Option(32, help="Prompts used for the CKA connectome."),
     capture_batch_size: int = typer.Option(8, help="Batch size for residual capture."),
-    load_in_4bit: bool = typer.Option(False, help="Load with bitsandbytes NF4 (for pythia-12b)."),
+    dtype: str = typer.Option(
+        "float32",
+        help="Weights precision: 'float32' (safe for small models; bf16 breaks their generation), "
+        "'bfloat16' (large models that do not fit in fp32), or 'int4' (bitsandbytes NF4, for pythia-12b).",
+    ),
     boot: int = typer.Option(4000, help="Bootstrap resamples over questions."),
     output_dir: Path = typer.Option(Path("results/pythia_guesstimation_rys"), help="Run output root."),
 ) -> None:
@@ -93,15 +97,16 @@ def _run(args: argparse.Namespace) -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = resolve_device()
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     rng = np.random.default_rng(args.seed)
+    load_in_4bit = args.dtype == "int4"
+    torch_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "int4": None}[args.dtype]
 
     tag = args.model.split("/")[-1]
     run_dir = args.output_dir / tag / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Device {device}, dtype {dtype}, 4bit={args.load_in_4bit}, run_dir {run_dir}", flush=True)
+    print(f"Device {device}, dtype {args.dtype}, run_dir {run_dir}", flush=True)
 
-    model, tok = load_pythia(args.model, device=device, dtype=dtype, load_in_4bit=args.load_in_4bit)
+    model, tok = load_pythia(args.model, device=device, dtype=torch_dtype, load_in_4bit=load_in_4bit)
     L = len(model.model.layers)
     questions = make_guesstimation_questions(seed=args.seed)
     n_q = len(questions)
@@ -180,7 +185,7 @@ def _run(args: argparse.Namespace) -> None:
 
     summary = {
         "model": args.model, "L": L, "n_questions": n_q, "n_windows": len(windows),
-        "load_in_4bit": args.load_in_4bit,
+        "dtype": args.dtype,
         "baseline_score": round(float(base.mean()), 4),
         "mean_delta": round(float(delta.mean()), 4),
         "best_delta": round(float(delta.max()), 4),
