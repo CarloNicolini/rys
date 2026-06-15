@@ -52,7 +52,9 @@ from rys.gsm8k_mc import (
     make_gsm8k_mc,
     mc_accuracy,
     parse_gold,
+    prepare_mc_batches,
     score_mc,
+    score_prepared,
 )
 from rys.modules import change_points, leiden_communities, plateau_metric
 from rys.nqueens_data import (
@@ -220,7 +222,9 @@ __all__ = [
     "make_gsm8k_mc",
     "mc_accuracy",
     "parse_gold",
+    "prepare_mc_batches",
     "score_mc",
+    "score_prepared",
     "encode_clause_tensor",
     "encode_formula",
     "encode_formula_assignment_factorized",

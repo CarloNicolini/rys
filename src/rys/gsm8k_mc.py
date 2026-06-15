@@ -160,69 +160,73 @@ def make_gsm8k_mc(
     return pd.DataFrame(rows)
 
 
-@torch.inference_mode()
-def score_mc(
-    model: torch.nn.Module,
-    tokenizer,
-    mc_df: pd.DataFrame,
-    device: str | torch.device | None = None,
-    batch_size: int = 16,
-) -> pd.DataFrame:
-    """Teacher-forced loglikelihood of every candidate continuation.
+def prepare_mc_batches(tokenizer, mc_df: pd.DataFrame, batch_size: int = 16) -> list[dict]:
+    """Tokenise once into reusable left-padded batches.
 
-    For each ``(problem, candidate)`` the continuation token ids are appended to
-    the prompt token ids and scored in one forward pass. Both the summed and the
-    per-token-mean continuation loglikelihood are returned so the caller can use
-    length-normalised accuracy (the headline metric, fair across multi-token
-    numbers).
-
-    Returns
-    -------
-    DataFrame with columns
-    ``[prompt_id, cand_idx, is_gold, n_tokens, loglik_sum, loglik_mean]``.
+    RYS replay never changes the inputs, so for an RYS window sweep the
+    tokenisation and padding should happen a single time and the resulting
+    tensors be reused for every window (the per-window cost is then the forward
+    pass alone). Each batch is a dict with CPU tensors ``input_ids``,
+    ``attention_mask``, ``cont_mask`` (continuation-token positions) and a
+    ``meta`` list of ``(prompt_id, cand_idx, is_gold, n_tokens)``.
     """
-    device = device or next(model.parameters()).device
     pad_id = tokenizer.pad_token_id
-
     items = []  # (prompt_id, cand_idx, is_gold, input_ids, n_cont)
     for row in mc_df.itertuples(index=False):
         prompt_ids = tokenizer(row.prompt, add_special_tokens=False)["input_ids"]
         for cand_idx, cand_str in enumerate(row.candidate_strs):
             cont_ids = tokenizer(cand_str, add_special_tokens=False)["input_ids"]
             items.append(
-                (
-                    row.prompt_id,
-                    cand_idx,
-                    cand_idx == row.gold_idx,
-                    prompt_ids + cont_ids,
-                    len(cont_ids),
-                )
+                (row.prompt_id, cand_idx, cand_idx == row.gold_idx, prompt_ids + cont_ids, len(cont_ids))
             )
 
-    records = []
-    model.eval()
+    batches = []
     for start in range(0, len(items), batch_size):
-        batch = items[start : start + batch_size]
-        max_len = max(len(seq) for _, _, _, seq, _ in batch)
-        input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
-        attn = torch.zeros((len(batch), max_len), dtype=torch.long)
-        cont_mask = torch.zeros((len(batch), max_len), dtype=torch.bool)
-        for r, (_, _, _, seq, n_cont) in enumerate(batch):
+        chunk = items[start : start + batch_size]
+        max_len = max(len(seq) for *_, seq, _ in chunk)
+        input_ids = torch.full((len(chunk), max_len), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(chunk), max_len), dtype=torch.long)
+        cont_mask = torch.zeros((len(chunk), max_len), dtype=torch.bool)
+        meta = []
+        for r, (pid, cand_idx, is_gold, seq, n_cont) in enumerate(chunk):
             input_ids[r, max_len - len(seq) :] = torch.tensor(seq, dtype=torch.long)
             attn[r, max_len - len(seq) :] = 1
             cont_mask[r, max_len - n_cont :] = True
+            meta.append((pid, cand_idx, is_gold, n_cont))
+        batches.append(
+            {"input_ids": input_ids, "attention_mask": attn, "cont_mask": cont_mask, "meta": meta}
+        )
+    return batches
 
-        input_ids = input_ids.to(device)
-        logits = model(input_ids=input_ids, attention_mask=attn.to(device), use_cache=False).logits
+
+@torch.inference_mode()
+def score_prepared(
+    model: torch.nn.Module,
+    batches: list[dict],
+    device: str | torch.device | None = None,
+) -> pd.DataFrame:
+    """Teacher-forced continuation loglikelihood for pre-tokenised batches.
+
+    Returns a DataFrame with columns
+    ``[prompt_id, cand_idx, is_gold, n_tokens, loglik_sum, loglik_mean]`` (both
+    the summed and per-token-mean continuation loglikelihood).
+    """
+    device = device or next(model.parameters()).device
+    model.eval()
+    records = []
+    for batch in batches:
+        input_ids = batch["input_ids"].to(device)
+        logits = model(
+            input_ids=input_ids, attention_mask=batch["attention_mask"].to(device), use_cache=False
+        ).logits
         logprobs = torch.log_softmax(logits.float(), dim=-1)
         # token at position t is predicted from logits at t-1
         token_lp = torch.zeros_like(input_ids, dtype=torch.float32)
         token_lp[:, 1:] = logprobs[:, :-1].gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
         token_lp = token_lp.cpu()
-
-        for r, (pid, cand_idx, is_gold, _, n_cont) in enumerate(batch):
-            mask = cont_mask[r]
-            total = float(token_lp[r][mask].sum())
+        cont_mask = batch["cont_mask"]
+        for r, (pid, cand_idx, is_gold, n_cont) in enumerate(batch["meta"]):
+            total = float(token_lp[r][cont_mask[r]].sum())
             records.append(
                 {
                     "prompt_id": pid,
@@ -234,6 +238,22 @@ def score_mc(
                 }
             )
     return pd.DataFrame(records)
+
+
+def score_mc(
+    model: torch.nn.Module,
+    tokenizer,
+    mc_df: pd.DataFrame,
+    device: str | torch.device | None = None,
+    batch_size: int = 16,
+) -> pd.DataFrame:
+    """Convenience wrapper: tokenise ``mc_df`` and score in one call.
+
+    For an RYS window sweep prefer :func:`prepare_mc_batches` once followed by
+    :func:`score_prepared` per window, to avoid re-tokenising every time.
+    """
+    batches = prepare_mc_batches(tokenizer, mc_df, batch_size=batch_size)
+    return score_prepared(model, batches, device=device)
 
 
 def mc_accuracy(scores: pd.DataFrame) -> dict[str, float]:

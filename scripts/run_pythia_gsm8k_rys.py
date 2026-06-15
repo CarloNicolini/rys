@@ -43,7 +43,7 @@ import typer
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
-from rys.gsm8k_mc import load_pythia, make_gsm8k_mc, mc_accuracy, score_mc
+from rys.gsm8k_mc import load_pythia, make_gsm8k_mc, mc_accuracy, prepare_mc_batches, score_prepared
 from rys.surgery import apply_rys
 from rys.theory_validation import junction_mismatch, rho_phi_table, theory_fit
 
@@ -88,29 +88,26 @@ def swept_windows(n_layers: int) -> list[tuple[int, int]]:
     return [(i, j) for i in range(n_layers) for j in range(i + 1, n_layers)]
 
 
-def baseline_accuracy(model, tokenizer, mc_df, device, batch_size) -> tuple[dict, pd.DataFrame]:
-    scores = score_mc(model, tokenizer, mc_df, device=device, batch_size=batch_size)
-    return mc_accuracy(scores), scores
-
-
 def delta_accuracy_matrix(
     model,
-    tokenizer,
-    mc_df: pd.DataFrame,
+    batches: list[dict],
     device: torch.device,
     *,
     n_layers: int,
     n_repeats: int,
-    batch_size: int,
     baseline_acc: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Sweep every RYS band and tabulate the change in MC accuracy."""
+    """Sweep every RYS band and tabulate the change in MC accuracy.
+
+    The pre-tokenised ``batches`` are reused for every window (RYS replay does
+    not change the inputs), so each window costs only forward passes.
+    """
     windows = swept_windows(n_layers)
     matrix = np.full((n_layers, n_layers), np.nan, dtype=float)
     rows = []
     for w_idx, (start, end) in enumerate(windows):
         with apply_rys(model, (start, end), n_repeats=n_repeats):
-            scores = score_mc(model, tokenizer, mc_df, device=device, batch_size=batch_size)
+            scores = score_prepared(model, batches, device=device)
         acc = mc_accuracy(scores)
         delta = acc["acc_norm"] - baseline_acc
         matrix[start, end] = delta
@@ -294,17 +291,16 @@ def _run(args: argparse.Namespace) -> None:
     mc_df.drop(columns=["candidates"]).to_json(run_dir / "mc_dataset.json", orient="records", indent=2)
     print(f"Built GSM8K MC set: {len(mc_df)} problems")
 
-    baseline, _ = baseline_accuracy(model, tokenizer, mc_df, device, args.batch_size)
+    batches = prepare_mc_batches(tokenizer, mc_df, batch_size=args.batch_size)
+    baseline = mc_accuracy(score_prepared(model, batches, device=device))
     print("Baseline:", json.dumps(baseline))
 
     matrix, long_delta = delta_accuracy_matrix(
         model,
-        tokenizer,
-        mc_df,
+        batches,
         device,
         n_layers=n_layers,
         n_repeats=args.n_repeats,
-        batch_size=args.batch_size,
         baseline_acc=baseline["acc_norm"],
     )
     matrix.to_csv(run_dir / "delta_accuracy.csv")
