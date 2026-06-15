@@ -29,13 +29,16 @@ def load_pythia(
     name: str = "EleutherAI/pythia-70m",
     device: str | torch.device = "cpu",
     dtype: torch.dtype | None = None,
+    load_in_4bit: bool = False,
 ):
     """Load a Pythia checkpoint ready for RYS surgery and CKA capture.
 
     The tokenizer is configured with ``padding_side='left'`` (required by the
     capture and generation helpers) and the model exposes ``model.model.layers``
     via an alias to ``model.gpt_neox`` so the existing RYS facilities work
-    unchanged.
+    unchanged. ``load_in_4bit`` uses bitsandbytes NF4 to fit large checkpoints
+    (e.g. ``pythia-12b``) on a single 24GB GPU; the model is then already placed
+    on the GPU and is not moved.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -44,8 +47,20 @@ def load_pythia(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype or torch.float32)
-    model.to(device).eval()
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+
+        quant = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(name, quantization_config=quant, device_map={"": 0})
+    else:
+        model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype or torch.float32)
+        model.to(device)
+    model.eval()
     model.model = model.gpt_neox  # expose `.model.layers` for apply_rys / capture
     return model, tokenizer
 

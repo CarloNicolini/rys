@@ -56,6 +56,14 @@ from rys.gsm8k_mc import (
     score_mc,
     score_prepared,
 )
+from rys.guesstimation import (
+    calculate_score,
+    generate_numbers,
+    make_guesstimation_questions,
+    parse_number,
+    probe_score,
+    score_estimates,
+)
 from rys.modules import change_points, leiden_communities, plateau_metric
 from rys.nqueens_data import (
     QueensDataset,
@@ -225,6 +233,12 @@ __all__ = [
     "prepare_mc_batches",
     "score_mc",
     "score_prepared",
+    "calculate_score",
+    "generate_numbers",
+    "make_guesstimation_questions",
+    "parse_number",
+    "probe_score",
+    "score_estimates",
     "encode_clause_tensor",
     "encode_formula",
     "encode_formula_assignment_factorized",
