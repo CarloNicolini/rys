@@ -65,6 +65,56 @@ def load_pythia(
     return model, tokenizer
 
 
+def load_causal_lm(
+    name: str,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype | None = None,
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+):
+    """Load a decoder-only HuggingFace model for RYS experiments.
+
+    Qwen/Llama-style models already expose ``model.model.layers``. Pythia is the
+    exception and is delegated to :func:`load_pythia` so the existing aliasing
+    behavior stays unchanged.
+    """
+    if "pythia" in name.lower():
+        return load_pythia(name, device=device, dtype=dtype, load_in_4bit=load_in_4bit)
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Choose at most one of load_in_8bit and load_in_4bit.")
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    kwargs = {"trust_remote_code": True}
+    if load_in_4bit:
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        kwargs["device_map"] = {"": 0}
+    elif load_in_8bit:
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        kwargs["device_map"] = {"": 0}
+    else:
+        kwargs["dtype"] = dtype or torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
+    if not (load_in_8bit or load_in_4bit):
+        model.to(device)
+    model.eval()
+
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise AttributeError(f"{type(model).__name__} does not expose `model.model.layers`.")
+    return model, tokenizer
+
+
 def parse_gold(answer: str) -> int | None:
     """Parse the integer after ``####`` in a GSM8K answer, or ``None``."""
     tail = answer.split("####", 1)[-1].strip().replace(",", "")

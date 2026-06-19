@@ -139,6 +139,8 @@ def functional_corr(delta_long: pd.DataFrame, rp: pd.DataFrame) -> tuple[pd.Data
         "spearman_delta_rho": corr("R"),
         "spearman_delta_cka": corr("cka_full"),
         "spearman_delta_plateau_pred": corr("one_minus_cka_plateau"),
+        "spearman_delta_Qpsi": corr("one_minus_cka_Qpsi"),
+        "spearman_delta_Rphi": corr("one_minus_cka_Rphi"),
         "spearman_delta_Q2": corr("Q2"),
         "best_delta": float(mg["delta_score"].max()) if len(mg) else float("nan"),
     }

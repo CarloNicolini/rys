@@ -48,6 +48,7 @@ from rys.coloring_message_passing import (
 from rys.data import csqa_prompts, gsm8k_prompts, mmlu_prompts
 from rys.gsm8k_mc import (
     build_distractors,
+    load_causal_lm,
     load_pythia,
     make_gsm8k_mc,
     mc_accuracy,
@@ -226,6 +227,7 @@ __all__ = [
     "delta_heatmap",
     "assignment_satisfies_formula",
     "build_distractors",
+    "load_causal_lm",
     "load_pythia",
     "make_gsm8k_mc",
     "mc_accuracy",

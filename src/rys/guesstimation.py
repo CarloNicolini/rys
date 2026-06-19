@@ -114,12 +114,15 @@ def _clone_layer_shared(layer: torch.nn.Module, new_idx: int) -> torch.nn.Module
     new_layer._parameters = dict(layer._parameters)
     new_layer._buffers = dict(layer._buffers)
     new_layer._modules = dict(layer._modules)
-    new_attn = copy.copy(layer.attention)
-    new_attn._parameters = dict(layer.attention._parameters)
-    new_attn._buffers = dict(layer.attention._buffers)
-    new_attn._modules = dict(layer.attention._modules)
-    new_attn.layer_idx = new_idx
-    new_layer._modules["attention"] = new_attn
+    attn_name = "attention" if hasattr(layer, "attention") else "self_attn"
+    attn = getattr(layer, attn_name)
+    new_attn = copy.copy(attn)
+    new_attn._parameters = dict(attn._parameters)
+    new_attn._buffers = dict(attn._buffers)
+    new_attn._modules = dict(attn._modules)
+    if hasattr(new_attn, "layer_idx"):
+        new_attn.layer_idx = new_idx
+    new_layer._modules[attn_name] = new_attn
     if "layer_idx" in new_layer.__dict__:
         new_layer.layer_idx = new_idx
     return new_layer
@@ -153,13 +156,18 @@ def rys_unrolled(model: torch.nn.Module, window: tuple[int, int] | None) -> Iter
 
     orig_layers = model.model.layers
     orig_n = model.config.num_hidden_layers
+    orig_layer_types = getattr(model.config, "layer_types", None)
     model.model.layers = torch.nn.ModuleList(unrolled)
     model.config.num_hidden_layers = len(unrolled)
+    if orig_layer_types is not None:
+        model.config.layer_types = [orig_layer_types[k] for k in path]
     try:
         yield
     finally:
         model.model.layers = orig_layers
         model.config.num_hidden_layers = orig_n
+        if orig_layer_types is not None:
+            model.config.layer_types = orig_layer_types
 
 
 _NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")

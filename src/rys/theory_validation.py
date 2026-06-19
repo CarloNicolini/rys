@@ -1,13 +1,13 @@
 """Validate the rho/phi CKA theory on a trained residual model.
 
-The companion blog posts derive a closed form for the linear-CKA edge between
-two residual-stream layers,
+The companion analysis derives a closed form for the linear-CKA edge between
+two residual-stream layers.  The generic small-residual law is governed by the
+cross-kernel perturbation,
 
-    CKA_ij = (1 + rho cos phi) / sqrt(1 + rho^2 + 2 rho cos phi),
+    1 - CKA_ij ~ 1/2 Q_ij^2 sin^2 Psi_ij,
 
-with a plateau expansion ``1 - CKA_ij ~ 1/2 rho^2 sin^2 phi`` and a first-order
-RYS prediction ``rho^RYS ~ 2 rho`` (hence ``1 - CKA^RYS ~ 4 (1 - CKA)`` on the
-plateau).  This module turns those statements into measurements on captured
+with the legacy self-Gram R/Phi predictor retained as a diagnostic for coherent
+residuals.  This module turns those statements into measurements on captured
 activations, reusing :mod:`rys.residual_force` for the heavy lifting and adding
 two dynamical-systems diagnostics (junction mismatch and block-Jacobian
 spectral radius) so the predictions can be linked to RYS behavioural windows.
@@ -32,17 +32,17 @@ def rho_phi_table(activations: pd.DataFrame) -> pd.DataFrame:
 
 
 def theory_fit(table: pd.DataFrame, *, plateau_threshold: float = 0.5) -> dict[str, float]:
-    """Quantify how well the rho/phi predictors explain measured ``1 - CKA``.
+    """Quantify how well the plateau predictors explain measured ``1 - CKA``.
 
     Returns Pearson and Spearman correlations between the measured
-    ``one_minus_cka_full`` and (a) the plateau predictor ``1/2 rho^2 sin^2 phi``
-    and (b) the cross-term ``Q^2`` that dominates when the residual is
-    incoherent with the identity stream.  Correlations are computed on the
-    plateau subset (measured ``1 - CKA <= plateau_threshold``) where the
-    expansion is valid.
+    ``one_minus_cka_full`` and the corrected ``1/2 Q^2 sin^2 Psi`` predictor,
+    plus legacy R/Phi and orthogonal ``1/2 Q^2`` diagnostics.  Correlations are
+    computed on the plateau subset (measured ``1 - CKA <= plateau_threshold``)
+    where the expansion is at least plausible.
     """
     plateau = table[table["one_minus_cka_full"] <= plateau_threshold].copy()
     plateau["Q2"] = plateau["Q"] ** 2
+    plateau["half_Q2"] = 0.5 * plateau["Q2"]
     measured = plateau["one_minus_cka_full"]
 
     def _safe_corr(a: pd.Series, b: pd.Series, method: str) -> float:
@@ -55,10 +55,18 @@ def theory_fit(table: pd.DataFrame, *, plateau_threshold: float = 0.5) -> dict[s
         "n_pairs_plateau": int(len(plateau)),
         "pearson_plateau_pred": _safe_corr(measured, plateau["one_minus_cka_plateau"], "pearson"),
         "spearman_plateau_pred": _safe_corr(measured, plateau["one_minus_cka_plateau"], "spearman"),
+        "pearson_Qpsi": _safe_corr(measured, plateau["one_minus_cka_Qpsi"], "pearson"),
+        "spearman_Qpsi": _safe_corr(measured, plateau["one_minus_cka_Qpsi"], "spearman"),
+        "pearson_Rphi": _safe_corr(measured, plateau["one_minus_cka_Rphi"], "pearson"),
+        "spearman_Rphi": _safe_corr(measured, plateau["one_minus_cka_Rphi"], "spearman"),
         "pearson_Q2": _safe_corr(measured, plateau["Q2"], "pearson"),
         "spearman_Q2": _safe_corr(measured, plateau["Q2"], "spearman"),
+        "pearson_half_Q2": _safe_corr(measured, plateau["half_Q2"], "pearson"),
+        "spearman_half_Q2": _safe_corr(measured, plateau["half_Q2"], "spearman"),
         "median_R": float(table["R"].median()),
         "median_cos_phi": float(table["cos_phi"].median()),
+        "median_Q": float(table["Q"].median()),
+        "median_cos_psi": float(table["cos_psi"].median()),
     }
 
 

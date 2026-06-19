@@ -193,7 +193,16 @@ def test_rho_phi_pipeline_runs() -> None:
     batch = next(iter(_loader()))
     activations = _capture_variable_states(model, batch)
     table = rho_phi_table(activations)
-    assert {"R", "cos_phi", "Q", "one_minus_cka_plateau", "one_minus_cka_full"} <= set(table.columns)
+    assert {
+        "R",
+        "cos_phi",
+        "Q",
+        "cos_psi",
+        "one_minus_cka_Rphi",
+        "one_minus_cka_Qpsi",
+        "one_minus_cka_plateau",
+        "one_minus_cka_full",
+    } <= set(table.columns)
     assert (table["layer_i"] < table["layer_j"]).all()
     fit = theory_fit(table)
     assert fit["n_pairs_total"] == len(table)

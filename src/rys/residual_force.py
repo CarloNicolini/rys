@@ -20,16 +20,16 @@ the post introduces two scalar summary statistics (Eq. 9 of the post)
   - :math:`\\cos\\Phi_{ij} = \\langle A_i, C_{ij} \\rangle_F /
     (\\| A_i \\|_F \\, \\| C_{ij} \\|_F)`
 
-and predicts (Eq. 10) the small-force plateau approximation
+and originally predicted the self-Gram small-force approximation
 
   :math:`1 - \\mathrm{CKA}_{ij} \\approx \\tfrac{1}{2}\\, \\mathcal{R}_{ij}^{2}\\,
   \\sin^{2}\\Phi_{ij}` .
 
-This module computes :math:`\\mathcal{R}^{2}` and :math:`\\cos\\Phi` directly
-from a captured activation tensor so the prediction can be tested against the
-empirical CKA, and it also forecasts the post-RYS CKA via the doubling
-substitution :math:`\\tilde{S}^{\\mathrm{rys}} \\approx 2\\,\\tilde{S}^{(0)}` of
-Eq. 13 (without re-running the model).
+This module computes both that legacy :math:`\\mathcal{R}/\\Phi` predictor and
+the corrected generic cross-Gram :math:`\\mathcal{Q}/\\Psi` predictor, and it
+also forecasts the post-RYS CKA via the doubling substitution
+:math:`\\tilde{S}^{\\mathrm{rys}} \\approx 2\\,\\tilde{S}^{(0)}` of Eq. 13
+(without re-running the model).
 
 Important caveat about Eq. 10
 -----------------------------
@@ -43,6 +43,12 @@ dominates :math:`1 - \\mathrm{CKA}` at order :math:`\\rho_{ij}^{2}` while
 :math:`\\rho_{ij}^{4}`.  We therefore expose a third scalar
 
   :math:`\\mathcal{Q}_{ij} = \\| M_{ij} + M_{ij}^\\top \\|_F / \\| A_i \\|_F`
+
+with phase :math:`\\Psi_{ij}` against the base kernel.  The generic plateau
+law is therefore
+
+  :math:`1 - \\mathrm{CKA}_{ij} \\approx \\tfrac{1}{2}\\, \\mathcal{Q}_{ij}^{2}\\,
+  \\sin^{2}\\Psi_{ij}` .
 
 so the user can check empirically which of :math:`\\mathcal{R}` and
 :math:`\\mathcal{Q}` carries the leading-order signal in their connectome,
@@ -156,17 +162,26 @@ def residual_force_matrices(
                               :math:`A_i` and :math:`C_{ij}`; invariant under
                               RYS to first order.
         ``sin2_phi``         :math:`1 - \\cos^{2}\\Phi_{ij}`.
+        ``cos_psi``          :math:`\\cos\\Psi_{ij}` — alignment between the
+                              base sample Gram and the cross-kernel
+                              perturbation.
+        ``sin2_psi``         :math:`1 - \\cos^{2}\\Psi_{ij}`.
         ``Q``                :math:`\\mathcal{Q}_{ij} = \\| M_{ij} + M_{ij}^\\top
                               \\|_F / \\| A_i \\|_F` where :math:`M_{ij} =
                               \\tilde{X}_i^\\top \\tilde{S}_{ij}` — the
                               cross-term that dominates Eq. 10 when the
                               residual is incoherent with the identity stream.
-        ``one_minus_cka_plateau`` Plateau-regime prediction of :math:`1 -
-                              \\mathrm{CKA}_{ij}` from Eq. 10 of the post:
+        ``one_minus_cka_Rphi`` Legacy self-Gram prediction of :math:`1 -
+                              \\mathrm{CKA}_{ij}`:
                               :math:`\\tfrac{1}{2} \\mathcal{R}_{ij}^{2}
                               \\sin^{2}\\Phi_{ij}`.  Quantitatively correct
                               only when the residual is highly *coherent*
                               with the identity stream.
+        ``one_minus_cka_Qpsi`` Generic cross-Gram plateau-regime prediction:
+                              :math:`\\tfrac{1}{2} \\mathcal{Q}_{ij}^{2}
+                              \\sin^{2}\\Psi_{ij}`.
+        ``one_minus_cka_plateau`` Alias of ``one_minus_cka_Qpsi`` for the
+                              current paper convention.
         ``cka_full``          Closed-form linear CKA from sample Grams
                               :math:`\\langle G_i, G_j\\rangle_F /
                               (\\|G_i\\|_F \\|G_j\\|_F)`.  Biased linear CKA;
@@ -178,7 +193,7 @@ def residual_force_matrices(
     Notes
     -----
     The matrices are symmetric except for ``S_norm``, ``R``, ``R2``,
-    ``cos_phi`` and ``sin2_phi`` which are *not* symmetric: their value at
+    ``cos_phi``, ``sin2_phi``, ``Q``, ``cos_psi`` and ``sin2_psi`` which are *not* symmetric: their value at
     :math:`(i, j)` is normalised by :math:`\\| A_i \\|_F` and so depends on
     which layer plays the role of the *identity stream*.  The post's
     convention is :math:`i < j`; for completeness we fill the strictly lower
@@ -195,6 +210,7 @@ def residual_force_matrices(
     s_norm = torch.zeros((L, L), dtype=dtype, device=device)
     R = torch.zeros((L, L), dtype=dtype, device=device)
     cos_phi = torch.full((L, L), float("nan"), dtype=dtype, device=device)
+    cos_psi = torch.full((L, L), float("nan"), dtype=dtype, device=device)
     Q = torch.zeros((L, L), dtype=dtype, device=device)
     cka_full = torch.zeros((L, L), dtype=dtype, device=device)
     one_minus_cka_full_pred = torch.zeros((L, L), dtype=dtype, device=device)
@@ -222,9 +238,14 @@ def residual_force_matrices(
             # Q = ||M + M^T||_F / ||A_i||_F. Using ||M+M^T||^2 = 2||M||^2 + 2 tr(M^2)
             # and the trace cycle tr(M^2) = tr((X S^T)(X S^T)) = ||S X^T X S^T... we can
             # compute it directly from G_M.
-            tr_M2 = _frobenius_inner(G_M, G_M.transpose(0, 1))
-            sym_norm_sq = 2.0 * G_M_norm * G_M_norm + 2.0 * tr_M2
-            Q[i, j] = torch.sqrt(torch.clamp(sym_norm_sq, min=0.0)) / g_norm[i]
+            T = G_M + G_M.transpose(0, 1)
+            T_norm = torch.linalg.norm(T)
+            Q[i, j] = T_norm / g_norm[i]
+            cos_psi[i, j] = (
+                _frobenius_inner(G[i], T) / (g_norm[i] * T_norm)
+                if T_norm > 0
+                else torch.tensor(float("nan"))
+            )
             # Closed-form CKA (biased; sample-Gram form).
             cka_ij = _frobenius_inner(G[i], G[j]) / (g_norm[i] * g_norm[j])
             cka_full[i, j] = cka_ij
@@ -232,7 +253,9 @@ def residual_force_matrices(
 
     R2 = R * R
     sin2_phi = 1.0 - cos_phi * cos_phi
-    one_minus_cka_plateau = 0.5 * R2 * sin2_phi
+    sin2_psi = 1.0 - cos_psi * cos_psi
+    one_minus_cka_Rphi = 0.5 * R2 * sin2_phi
+    one_minus_cka_Qpsi = 0.5 * Q * Q * sin2_psi
 
     def _frame(t: torch.Tensor) -> pd.DataFrame:
         return pd.DataFrame(
@@ -247,8 +270,12 @@ def residual_force_matrices(
         "R2": _frame(R2),
         "cos_phi": _frame(cos_phi),
         "sin2_phi": _frame(sin2_phi),
+        "cos_psi": _frame(cos_psi),
+        "sin2_psi": _frame(sin2_psi),
         "Q": _frame(Q),
-        "one_minus_cka_plateau": _frame(one_minus_cka_plateau),
+        "one_minus_cka_Rphi": _frame(one_minus_cka_Rphi),
+        "one_minus_cka_Qpsi": _frame(one_minus_cka_Qpsi),
+        "one_minus_cka_plateau": _frame(one_minus_cka_Qpsi),
         "cka_full": _frame(cka_full),
     }
 
@@ -291,7 +318,11 @@ def residual_force_long(
                     "R2": float(bundle["R2"].at[i, j]),
                     "cos_phi": float(bundle["cos_phi"].at[i, j]),
                     "sin2_phi": float(bundle["sin2_phi"].at[i, j]),
+                    "cos_psi": float(bundle["cos_psi"].at[i, j]),
+                    "sin2_psi": float(bundle["sin2_psi"].at[i, j]),
                     "Q": float(bundle["Q"].at[i, j]),
+                    "one_minus_cka_Rphi": float(bundle["one_minus_cka_Rphi"].at[i, j]),
+                    "one_minus_cka_Qpsi": float(bundle["one_minus_cka_Qpsi"].at[i, j]),
                     "one_minus_cka_plateau": float(bundle["one_minus_cka_plateau"].at[i, j]),
                     "cka_full": float(bundle["cka_full"].at[i, j]),
                     "one_minus_cka_full": float(1.0 - bundle["cka_full"].at[i, j]),

@@ -36,7 +36,7 @@ import torch
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
-from rys.gsm8k_mc import load_pythia
+from rys.gsm8k_mc import load_causal_lm
 from rys.guesstimation import make_guesstimation_questions
 from rys.residual_force import residual_force_long
 from rys.theory_validation import theory_fit
@@ -153,7 +153,7 @@ def plateau_score(cka: pd.DataFrame) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="EleutherAI/pythia-70m")
-    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "int4"])
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "int8", "int4"])
     ap.add_argument("--n-prompts", type=int, default=32)
     ap.add_argument("--top-k-dims", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
@@ -161,13 +161,18 @@ def main() -> None:
     args = ap.parse_args()
 
     device = resolve_device()
-    load_in_4bit = args.dtype == "int4"
-    torch_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "int4": None}[args.dtype]
+    torch_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "int8": None, "int4": None}[args.dtype]
     tag = args.model.split("/")[-1]
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
-    model, tok = load_pythia(args.model, device=device, dtype=torch_dtype, load_in_4bit=load_in_4bit)
+    model, tok = load_causal_lm(
+        args.model,
+        device=device,
+        dtype=torch_dtype,
+        load_in_8bit=args.dtype == "int8",
+        load_in_4bit=args.dtype == "int4",
+    )
     cka_device = device if device.type == "cuda" else "cpu"
 
     qs = make_guesstimation_questions(seed=args.seed)[: args.n_prompts]
