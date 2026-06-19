@@ -11,9 +11,9 @@ linear controls that preserve residual telescoping:
 - global_standardize;
 - global_standardize plus the sink/top-dimension controls.
 
-If a matching ``delta_score_long.csv`` exists, or ``--delta-long`` is provided,
-the script also joins every geometry variant to the already-computed RYS deltas.
-No RYS window is reswept here.
+If a matching canonical Qwen/Pythia ``delta_score_long.csv`` exists, or
+``--delta-long`` is provided, the script also joins every geometry variant to the
+already-computed RYS deltas. No RYS window is reswept here.
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ def latest_delta_long(model_tag: str) -> Path | None:
         f"results/qwen_guesstimation_rys/{model_tag}/*/delta_score_long.csv",
         f"results/pythia_guesstimation_rys/{model_tag}/*/delta_score_long.csv",
         f"results/pythia_guesstimation_rys/pythia-{model_tag}/*/delta_score_long.csv",
-        f"results/*guesstimation*/{model_tag}/*/delta_score_long.csv",
     ]
     runs = sorted(path for pattern in patterns for path in glob.glob(pattern))
     return Path(runs[-1]) if runs else None
@@ -217,7 +216,9 @@ def main() -> None:
     (out / "massive_activation_stats.json").write_text(json.dumps(stats_public, indent=2))
 
     delta_path = args.delta_long or latest_delta_long(tag)
-    delta_long = pd.read_csv(delta_path) if delta_path is not None and delta_path.exists() else None
+    if args.delta_long is not None and not args.delta_long.exists():
+        raise FileNotFoundError(f"--delta-long does not exist: {args.delta_long}")
+    delta_long = pd.read_csv(delta_path) if delta_path is not None else None
 
     summary: dict[str, object] = {
         "model": args.model,
