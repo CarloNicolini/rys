@@ -36,6 +36,7 @@ import torch
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
+from rys.eval_core import resolve_device
 from rys.gsm8k_mc import load_causal_lm
 from rys.guesstimation import make_guesstimation_questions
 from rys.residual_force import residual_force_long
@@ -75,14 +76,6 @@ DIVERSE_PROMPTS = [
     "The marathon route winds through five historic neighbourhoods of the city.",
     "Light from the nearest star beyond the Sun takes over four years to reach us.",
 ]
-
-
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def pooled_by_layer(acts: pd.DataFrame) -> dict[int, np.ndarray]:

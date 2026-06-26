@@ -1,261 +1,235 @@
-"""Generic robust geometry controls for decoder-only Hugging Face LMs.
+"""Unified robust geometry controls and predictive RYS theory, model-agnostic.
 
-This is the model-agnostic companion of ``run_pythia_robust_geometry_controls.py``.
-It recomputes only representation geometry from a fixed prompt set, under global
-linear controls that preserve residual telescoping:
+This is the model-agnostic companion of ``run_guesstimation_rys.py``. Given any
+HuggingFace decoder-only model it captures the residual stream on a fixed
+prompt set and computes the full battery of geometry predictors of the RYS
+effect, under two activation regimes:
 
-- raw;
-- drop_first_token;
-- drop_top_dims;
-- clamp_top_dims_to_mean;
-- global_standardize;
-- global_standardize plus the sink/top-dimension controls.
+- **raw** activations (massive-activation subspace included);
+- **robustified** activations (sink token dropped, top-``k`` highest-variance
+  dimensions clamped to their mean, dimensions globally standardised).
 
-If a matching canonical Qwen/Pythia ``delta_score_long.csv`` exists, or
-``--delta-long`` is provided, the script also joins every geometry variant to the
-already-computed RYS deltas. No RYS window is reswept here.
+The robustified regime tests whether the *bulk* geometry — independent of the
+few saturating dimensions that push raw CKA toward 1 — still predicts the
+effect. Across the Pythia/Qwen ladder suppressing that subspace sometimes
+*strengthens* and sometimes *weakens* the geometry→effect correlation, so both
+regimes are reported.
+
+For each regime it computes:
+
+1. The residual-force decomposition (``R``, ``Q``, ``cos_phi``, ``cos_psi``,
+   ``cka_full``) via :mod:`rys.residual_force` — the existing theory.
+2. The **three-regime decomposition** from :mod:`rys.geometry_predictors`:
+   - ``coherent_force``    — the component of the residual force aligned with
+     the identity stream (RYS-productive);
+   - ``incoherent_force``  — the orthogonal cross-term (RYS-destructive);
+   - ``coherence_ratio``   — their ratio, the headline geometric predictor;
+   - ``junction_misalignment`` — how far the band-output manifold sits from
+     the band-input manifold (boundary condition).
+3. The **composite RYS safety score** combining coherence, junction
+   misalignment, and (when a matching ``delta_score_long.csv`` with the band
+   Jacobian exists) the Jacobian contraction modulus.
+
+If a matching ``delta_score_long.csv`` (and optionally
+``jacobian_sigma_max`` via ``delta_score_long.csv``) from a prior
+``run_guesstimation_rys`` run is found — or one is supplied via
+``--delta-long`` — every predictor is joined to the RYS deltas and a
+functional summary (Spearman correlations + best window) is emitted per
+regime. No RYS window is reswept here: the deltas are fixed and only the
+geometry is recomputed under each control.
+
+Outputs land in ``results/LLM/<family>/robust_geometry_controls/<tag>/`` to
+mirror the guesstimation script's layout.
+
+Examples
+--------
+::
+
+    uv run python scripts/run_robust_geometry_controls.py --model EleutherAI/pythia-70m
+    uv run python scripts/run_robust_geometry_controls.py --model Qwen/Qwen3-0.6B --dtype float32
+    uv run python scripts/run_robust_geometry_controls.py --model meta-llama/Llama-3.2-1B \
+        --delta-long results/LLM/llama/guesstimation_rys/Llama-3.2-1B/<ts>/delta_score_long.csv
+
+Smoke test (tiny subset, any model)::
+
+    uv run python scripts/run_robust_geometry_controls.py --model EleutherAI/pythia-70m \
+        --capture-n 4 --top-k-dims 3
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import json
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
+from rys.eval_core import (
+    cka_device_for,
+    functional_corr,
+    infer_family,
+    latest_delta_long,
+    resolve_device,
+    resolve_dtype,
+    save_heatmap,
+    square_from_long,
+)
+from rys.geometry_predictors import (
+    coherence_table,
+    composite_safety_score,
+    junction_misalignment_table,
+    massive_activation_stats,
+    robustify_activations,
+)
 from rys.gsm8k_mc import load_causal_lm
 from rys.guesstimation import make_guesstimation_questions
 from rys.residual_force import residual_force_long
 from rys.theory_validation import theory_fit
 
 
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def latest_delta_long(model_tag: str) -> Path | None:
-    patterns = [
-        f"results/qwen_guesstimation_rys/{model_tag}/*/delta_score_long.csv",
-        f"results/pythia_guesstimation_rys/{model_tag}/*/delta_score_long.csv",
-        f"results/pythia_guesstimation_rys/pythia-{model_tag}/*/delta_score_long.csv",
-    ]
-    runs = sorted(path for pattern in patterns for path in glob.glob(pattern))
-    return Path(runs[-1]) if runs else None
-
-
-def arrays(activations: pd.DataFrame) -> list[np.ndarray]:
-    return [np.atleast_2d(np.asarray(x)).astype(np.float64, copy=False) for x in activations["activation"]]
-
-
-def global_stats(activations: pd.DataFrame) -> dict[str, object]:
-    xs = arrays(activations)
-    all_x = np.concatenate(xs, axis=0)
-    mean = all_x.mean(axis=0)
-    var = all_x.var(axis=0)
-    std = np.sqrt(var + 1e-8)
-    order = np.argsort(var)[::-1]
-    total = float(var.sum())
-    if total <= 0:
-        fractions = {
-            "top1_dim_var_frac": float("nan"),
-            "top5_dim_var_frac": float("nan"),
-            "top10_dim_var_frac": float("nan"),
-        }
-    else:
-        fractions = {
-            "top1_dim_var_frac": float(var[order[0]] / total),
-            "top5_dim_var_frac": float(var[order[:5]].sum() / total),
-            "top10_dim_var_frac": float(var[order[:10]].sum() / total),
-        }
-    return {
-        "mean": mean,
-        "std": std,
-        "order": order,
-        "d_model": int(var.size),
-        "top_dims": order[:10].astype(int).tolist(),
-        **fractions,
-    }
-
-
-def transform_activations(
-    activations: pd.DataFrame,
-    variant: str,
-    *,
-    stats: dict[str, object],
-    top_k_dims: int,
-) -> pd.DataFrame:
-    top_dims = np.asarray(stats["order"][:top_k_dims], dtype=int)
-    mean = np.asarray(stats["mean"])
-    std = np.asarray(stats["std"])
-
-    def transform_one(x: np.ndarray) -> np.ndarray:
-        y = np.array(x, dtype=np.float64, copy=True)
-        if "drop_first_token" in variant and y.shape[0] > 1:
-            y = y[1:]
-        if "clamp_top_dims" in variant and top_k_dims > 0:
-            y[:, top_dims] = mean[top_dims]
-        if "global_standardize" in variant:
-            y = y / std
-        if "drop_top_dims" in variant and top_k_dims > 0:
-            y = np.delete(y, top_dims, axis=1)
-        return y
-
-    out = activations.copy()
-    if variant == "raw":
-        return out
-    out["activation"] = [transform_one(x) for x in arrays(activations)]
-    return out
-
-
-def median_offdiag(cka: pd.DataFrame) -> float:
-    m = cka.to_numpy(dtype=float)
-    iu = np.triu_indices_from(m, k=1)
-    return float(np.nanmedian(m[iu]))
-
-
-def functional_corr(delta_long: pd.DataFrame, rho_phi: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
-    merged = delta_long.merge(rho_phi, left_on=["start", "end"], right_on=["layer_i", "layer_j"], how="inner")
-
-    def corr(column: str) -> float:
-        if len(merged) < 3 or merged["delta_score"].std() == 0 or merged[column].std() == 0:
-            return float("nan")
-        return float(spearmanr(merged["delta_score"], merged[column]).statistic)
-
-    merged = merged.copy()
-    merged["Q2"] = merged["Q"] ** 2
-    summary = {
-        "n_windows": int(len(merged)),
-        "spearman_delta_rho": corr("R"),
-        "spearman_delta_cka": corr("cka_full"),
-        "spearman_delta_Qpsi": corr("one_minus_cka_Qpsi"),
-        "spearman_delta_Rphi": corr("one_minus_cka_Rphi"),
-        "spearman_delta_Q2": corr("Q2"),
-        "best_delta": float(merged["delta_score"].max()) if len(merged) else float("nan"),
-    }
-    if len(merged):
-        best = merged.loc[merged["delta_score"].idxmax()]
-        summary["best_window_start"] = int(best["start"])
-        summary["best_window_end"] = int(best["end"])
-    return merged, summary
-
-
-def variants_for(top_k_dims: int) -> list[str]:
-    variants = [
-        "raw",
-        "drop_first_token",
-        "global_standardize",
-        "global_standardize_drop_first_token",
-    ]
-    if top_k_dims > 0:
-        variants.extend(
-            [
-                "drop_top_dims",
-                "clamp_top_dims",
-                "global_standardize_drop_top_dims",
-                "global_standardize_clamp_top_dims",
-                "global_standardize_drop_top_dims_drop_first_token",
-            ]
-        )
-    return variants
+def latest_jacobian_long(family: str, tag: str) -> Path | None:
+    """Find the matching delta_score_long.csv (which carries jacobian_sigma_max)."""
+    return latest_delta_long(family, tag)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="Hugging Face causal LM checkpoint.")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "int8", "int4"])
-    parser.add_argument("--capture-n", type=int, default=44)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default="EleutherAI/pythia-70m", help="HuggingFace checkpoint.")
+    parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "int8", "int4"])
+    parser.add_argument("--capture-n", type=int, default=44, help="Prompts used for the CKA connectome.")
     parser.add_argument("--capture-batch-size", type=int, default=8)
-    parser.add_argument("--top-k-dims", type=int, default=5)
+    parser.add_argument("--top-k-dims", type=int, default=5, help="Number of top-variance dims to clamp in the robustified regime.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--delta-long", type=Path, default=None, help="Optional explicit delta_score_long.csv.")
-    parser.add_argument("--output-dir", default="results/robust_geometry_controls")
+    parser.add_argument("--delta-long", type=Path, default=None, help="Explicit delta_score_long.csv (carries jacobian_sigma_max).")
+    parser.add_argument("--family", default="", help="Output family bucket; auto-inferred if empty.")
+    parser.add_argument("--output-dir", type=Path, default=Path("results/LLM"))
     args = parser.parse_args()
 
     device = resolve_device()
-    torch_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "int8": None, "int4": None}[
-        args.dtype
-    ]
+    torch_dtype = resolve_dtype(args.dtype)
     tag = args.model.split("/")[-1]
-    out = Path(args.output_dir) / tag
-    out.mkdir(parents=True, exist_ok=True)
+    family = args.family or infer_family(args.model)
+    run_dir = args.output_dir / family / "robust_geometry_controls" / tag / time.strftime("%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Device {device}, dtype {args.dtype}, family {family}, run_dir {run_dir}", flush=True)
 
-    model, tokenizer = load_causal_lm(
-        args.model,
-        device=device,
-        dtype=torch_dtype,
-        load_in_8bit=args.dtype == "int8",
-        load_in_4bit=args.dtype == "int4",
+    model, tok = load_causal_lm(
+        args.model, device=device, dtype=torch_dtype,
+        load_in_8bit=args.dtype == "int8", load_in_4bit=args.dtype == "int4",
     )
-    cka_device = device if device.type == "cuda" else "cpu"
+    L = len(model.model.layers)
+    cka_device = cka_device_for(device)
 
     questions = make_guesstimation_questions(seed=args.seed)[: args.capture_n]
     prompts = pd.DataFrame(
         {"prompt_id": [f"q{i}" for i in range(len(questions))], "prompt": [q["question"] for q in questions]}
     )
-    activations = capture_residual_stream(
-        model,
-        tokenizer,
-        prompts,
-        batch_size=args.capture_batch_size,
-        device=device,
-    )
+    activations = capture_residual_stream(model, tok, prompts, batch_size=args.capture_batch_size, device=device)
+    print(f"{tag}: L={L}, captured {len(activations)//L} prompts", flush=True)
 
-    stats = global_stats(activations)
-    stats_public = {key: value for key, value in stats.items() if key not in {"mean", "std", "order"}}
-    (out / "massive_activation_stats.json").write_text(json.dumps(stats_public, indent=2))
+    # Massive-activation diagnostics.
+    stats = massive_activation_stats(activations)
+    stats_public = {k: v for k, v in stats.items() if k not in {"mean", "std", "order"}}
+    (run_dir / "massive_activation_stats.json").write_text(json.dumps(stats_public, indent=2))
+    print(f"  top1 dim var frac = {stats_public['top1']:.3f}, top5 = {stats_public['top5']:.3f}", flush=True)
 
-    delta_path = args.delta_long or latest_delta_long(tag)
+    # Locate the matching RYS deltas + Jacobian, if any.
+    delta_path = args.delta_long if args.delta_long is not None else latest_delta_long(family, tag)
     if args.delta_long is not None and not args.delta_long.exists():
         raise FileNotFoundError(f"--delta-long does not exist: {args.delta_long}")
     delta_long = pd.read_csv(delta_path) if delta_path is not None else None
+    has_jacobian = delta_long is not None and "jacobian_sigma_max" in delta_long.columns
+    if delta_long is not None:
+        print(f"  joined to deltas: {delta_path} (jacobian={'yes' if has_jacobian else 'no'})", flush=True)
 
     summary: dict[str, object] = {
-        "model": args.model,
-        "dtype": args.dtype,
-        "capture_n": len(questions),
-        "top_k_dims": args.top_k_dims,
+        "model": args.model, "family": family, "L": L, "dtype": args.dtype,
+        "capture_n": len(questions), "top_k_dims": args.top_k_dims,
         "delta_source": str(delta_path) if delta_long is not None else None,
+        "has_jacobian": has_jacobian,
         "massive_activation_stats": stats_public,
-        "variants": {},
+        "regimes": {},
     }
     all_merged = []
 
-    for variant in variants_for(args.top_k_dims):
-        print(f"{tag}: {variant}", flush=True)
-        activations_v = transform_activations(activations, variant, stats=stats, top_k_dims=args.top_k_dims)
-        rho_phi = residual_force_long(activations_v, upper_only=True, dtype=torch.float64)
-        cka = cka_matrix(activations_v, unbiased=False, device=cka_device)
-        rho_phi.to_csv(out / f"rho_phi_{variant}.csv", index=False)
-        cka.to_csv(out / f"cka_{variant}.csv")
+    for regime in ("raw", "robust"):
+        print(f"{tag}: {regime}", flush=True)
+        if regime == "raw":
+            acts_v = activations
+        else:
+            acts_v = robustify_activations(
+                activations, stats=stats, top_k_dims=args.top_k_dims,
+                drop_first_token=True, global_standardize=True,
+            )
 
-        variant_summary: dict[str, object] = {
-            "median_offdiag_cka": median_offdiag(cka),
+        # 1. Existing residual-force theory (rho/phi/Q/psi + CKA).
+        rho_phi = residual_force_long(acts_v, upper_only=True, dtype=torch.float64)
+        cka = cka_matrix(acts_v, unbiased=False, device=cka_device)
+        rho_phi.to_csv(run_dir / f"rho_phi_{regime}.csv", index=False)
+        cka.to_csv(run_dir / f"cka_{regime}.csv")
+        save_heatmap(cka, run_dir / f"cka_{regime}.png",
+                      title=f"CKA connectome ({tag}, {regime})", cmap="viridis",
+                      cbar_label="CKA", diverging=False)
+
+        # 2. Three-regime decomposition: coherent/incoherent force + junction.
+        coh = coherence_table(acts_v, device=cka_device)
+        junction = junction_misalignment_table(acts_v)
+        coh.to_csv(run_dir / f"coherence_{regime}.csv", index=False)
+        junction.to_csv(run_dir / f"junction_misalignment_{regime}.csv", index=False)
+
+        # Heatmaps of the new predictors.
+        for col, title, cmap, div in [
+            ("coherence_ratio", f"Coherence ratio K ({tag}, {regime})", "RdBu_r", True),
+            ("coherent_force", f"Coherent force (RYS-productive) ({tag}, {regime})", "viridis", False),
+            ("incoherent_force", f"Incoherent force (RYS-destructive) ({tag}, {regime})", "viridis", False),
+        ]:
+            save_heatmap(square_from_long(coh, L, col, "layer_i", "layer_j"),
+                        run_dir / f"{col}_{regime}.png", title=title, cmap=cmap,
+                        cbar_label=col, diverging=div)
+        save_heatmap(square_from_long(junction, L, "junction_misalignment", "layer_i", "layer_j"),
+                     run_dir / f"junction_misalignment_{regime}.png",
+                     title=f"Junction misalignment ({tag}, {regime})", cmap="viridis",
+                     cbar_label="m_ij", diverging=False)
+
+        # 3. Composite safety score (with Jacobian if available).
+        jacobian_df = None
+        if has_jacobian:
+            jacobian_df = delta_long[["start", "end", "jacobian_sigma_max"]].copy()
+        composite = composite_safety_score(coh, junction, jacobian_df)
+        composite.to_csv(run_dir / f"composite_safety_{regime}.csv", index=False)
+        save_heatmap(square_from_long(composite, L, "rys_safety_score", "layer_i", "layer_j"),
+                     run_dir / f"rys_safety_score_{regime}.png",
+                     title=f"Composite RYS safety score ({tag}, {regime})", cmap="RdBu_r",
+                     cbar_label="S_ij (higher = safer to duplicate)", diverging=True)
+
+        regime_summary: dict[str, object] = {
+            "median_offdiag_cka": float(np.nanmedian(cka.to_numpy(float)[np.triu_indices_from(cka, k=1)])),
             "theory_fit": theory_fit(rho_phi),
         }
+
+        # 4. Functional correlations with the RYS deltas, if available.
         if delta_long is not None:
-            merged, functional = functional_corr(delta_long, rho_phi)
-            merged.insert(0, "variant", variant)
+            predictors = composite if has_jacobian else composite
+            merged, functional = functional_corr(delta_long, predictors)
+            merged.insert(0, "regime", regime)
             all_merged.append(merged)
-            variant_summary["functional"] = functional
-        summary["variants"][variant] = variant_summary
+            regime_summary["functional"] = functional
+
+        summary["regimes"][regime] = regime_summary
 
     if all_merged:
-        pd.concat(all_merged, ignore_index=True).to_csv(out / "delta_geometry_by_variant.csv", index=False)
+        pd.concat(all_merged, ignore_index=True).to_csv(
+            run_dir / "delta_geometry_by_regime.csv", index=False
+        )
 
-    (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     print(json.dumps(summary, indent=2, default=str), flush=True)
-    print(f"Wrote {out}", flush=True)
+    print(f"Wrote {run_dir}", flush=True)
 
 
 if __name__ == "__main__":

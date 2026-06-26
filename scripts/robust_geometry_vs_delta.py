@@ -25,22 +25,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
+from rys.eval_core import cka_device_for, functional_corr as _functional_corr, resolve_device
 from rys.gsm8k_mc import load_causal_lm
 from rys.guesstimation import make_guesstimation_questions
 from rys.residual_force import residual_force_long
 from rys.theory_validation import theory_fit
-
-
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def global_per_dim_std(acts: pd.DataFrame) -> np.ndarray:
@@ -65,13 +57,13 @@ def latest_delta_long(tag: str) -> Path | None:
 
 
 def functional_corr(delta_long: pd.DataFrame, rp: pd.DataFrame) -> dict:
-    mg = delta_long.merge(rp, left_on=["start", "end"], right_on=["layer_i", "layer_j"], how="inner")
+    _, summary = _functional_corr(delta_long, rp)
     return {
-        "n_windows": int(len(mg)),
-        "spearman_delta_rho": float(spearmanr(mg["delta_score"], mg["R"]).statistic),
-        "spearman_delta_cka": float(spearmanr(mg["delta_score"], mg["cka_full"]).statistic),
-        "spearman_delta_Qpsi": float(spearmanr(mg["delta_score"], mg["one_minus_cka_Qpsi"]).statistic),
-        "spearman_delta_Rphi": float(spearmanr(mg["delta_score"], mg["one_minus_cka_Rphi"]).statistic),
+        "n_windows": summary["n_windows"],
+        "spearman_delta_rho": summary["spearman_delta_R"],
+        "spearman_delta_cka": summary["spearman_delta_cka_full"],
+        "spearman_delta_Qpsi": summary["spearman_delta_one_minus_cka_Qpsi"],
+        "spearman_delta_Rphi": summary["spearman_delta_one_minus_cka_Rphi"],
     }
 
 
@@ -97,7 +89,7 @@ def main() -> None:
         load_in_8bit=args.dtype == "int8",
         load_in_4bit=args.dtype == "int4",
     )
-    cka_device = device if device.type == "cuda" else "cpu"
+    cka_device = cka_device_for(device)
 
     # Same connectome prompts the guesstimation run used.
     qs = make_guesstimation_questions(seed=args.seed)[: args.capture_n]

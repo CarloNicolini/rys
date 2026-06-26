@@ -1,7 +1,7 @@
 """Apply RYS to Pythia (GPT-NeoX) models on a small GSM8K multiple-choice set.
 
 This is the large-language-model counterpart of
-:mod:`scripts.run_rys_accuracy_matrix`. It extends the RYS theory from the
+:mod:`scripts.constrained_satisfaction.run_rys_accuracy_matrix`. It extends the RYS theory from the
 controlled toy solvers to a real pretrained LLM family (Pythia) on GSM8K,
 producing the two headline objects of the paper for a frozen model:
 
@@ -35,7 +35,6 @@ import json
 import time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -43,6 +42,7 @@ import typer
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
+from rys.eval_core import cka_device_for, resolve_device, save_heatmap, swept_windows
 from rys.gsm8k_mc import load_pythia, make_gsm8k_mc, mc_accuracy, prepare_mc_batches, score_prepared
 from rys.surgery import apply_rys
 from rys.theory_validation import junction_mismatch, rho_phi_table, theory_fit
@@ -66,26 +66,8 @@ def main(
     _run(args)
 
 
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def pick_dtype(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if device.type == "cuda" else torch.float32
-
-
-def swept_windows(n_layers: int) -> list[tuple[int, int]]:
-    """Half-open windows ``(i, j)`` valid for ``apply_rys``: ``0 <= i < j < L``.
-
-    ``apply_rys`` hooks the input of layer ``j`` and replays layers ``i..j-1``,
-    so ``j`` must index a real layer (``j <= L-1``); the final layer is never
-    inside a replayed band.
-    """
-    return [(i, j) for i in range(n_layers) for j in range(i + 1, n_layers)]
 
 
 def delta_accuracy_matrix(
@@ -146,8 +128,7 @@ def compute_cka(
     )
     # CKA is O(L^2 * N^2); run it on the model device (GPU) so the many-layer
     # connectome of the larger models stays cheap.
-    cka_device = device if device.type == "cuda" else "cpu"
-    cka = cka_matrix(activations, unbiased=False, device=cka_device)
+    cka = cka_matrix(activations, unbiased=False, device=cka_device_for(device))
     return cka, activations
 
 
@@ -173,36 +154,6 @@ def geometry_diagnostics(
             }
         )
     return rho_phi, fit, band_rows
-
-
-def save_heatmap(
-    matrix: pd.DataFrame,
-    path: Path,
-    *,
-    title: str,
-    cmap: str,
-    cbar_label: str,
-    diverging: bool,
-) -> None:
-    values = matrix.to_numpy(dtype=float)
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return
-    if diverging:
-        bound = max(abs(float(finite.min())), abs(float(finite.max())), 1e-6)
-        vmin, vmax = -bound, bound
-    else:
-        vmin, vmax = float(finite.min()), float(finite.max())
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax)
-    ax.set_title(title)
-    ax.set_xlabel("end layer j (half-open band [i, j))")
-    ax.set_ylabel("start layer i")
-    ax.set_xticks(range(matrix.shape[1]))
-    ax.set_yticks(range(matrix.shape[0]))
-    fig.colorbar(im, ax=ax, label=cbar_label)
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
 
 
 def sample_generations(model, tokenizer, mc_df, device, *, n: int = 5, max_new_tokens: int = 32) -> list[dict]:

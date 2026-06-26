@@ -27,20 +27,9 @@ import pandas as pd
 import torch
 from scipy.stats import binomtest, spearmanr
 
+from rys.eval_core import resolve_device, swept_windows
 from rys.gsm8k_mc import load_pythia, make_gsm8k_mc, prepare_mc_batches, score_prepared
 from rys.surgery import apply_rys
-
-
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def swept_windows(L: int) -> list[tuple[int, int]]:
-    return [(i, j) for i in range(L) for j in range(i + 1, L)]
 
 
 def correctness_vector(scores: pd.DataFrame, mc_df: pd.DataFrame) -> np.ndarray:

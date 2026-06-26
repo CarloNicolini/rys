@@ -35,22 +35,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 
 from rys.activations import capture_residual_stream
 from rys.cka import cka_matrix
+from rys.eval_core import cka_device_for, functional_corr as eval_core_functional_corr, resolve_device
 from rys.gsm8k_mc import load_pythia
 from rys.guesstimation import make_guesstimation_questions
 from rys.residual_force import residual_force_long
 from rys.theory_validation import theory_fit
-
-
-def resolve_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def latest_delta_long(model_tag: str) -> Path | None:
@@ -125,30 +117,10 @@ def median_offdiag(cka: pd.DataFrame) -> float:
 
 
 def functional_corr(delta_long: pd.DataFrame, rp: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
-    mg = delta_long.merge(rp, left_on=["start", "end"], right_on=["layer_i", "layer_j"], how="inner")
-
-    def corr(column: str) -> float:
-        if len(mg) < 3 or mg["delta_score"].std() == 0 or mg[column].std() == 0:
-            return float("nan")
-        return float(spearmanr(mg["delta_score"], mg[column]).statistic)
-
-    mg = mg.copy()
-    mg["Q2"] = mg["Q"] ** 2
-    summary = {
-        "n_windows": int(len(mg)),
-        "spearman_delta_rho": corr("R"),
-        "spearman_delta_cka": corr("cka_full"),
-        "spearman_delta_plateau_pred": corr("one_minus_cka_plateau"),
-        "spearman_delta_Qpsi": corr("one_minus_cka_Qpsi"),
-        "spearman_delta_Rphi": corr("one_minus_cka_Rphi"),
-        "spearman_delta_Q2": corr("Q2"),
-        "best_delta": float(mg["delta_score"].max()) if len(mg) else float("nan"),
-    }
-    if len(mg):
-        best = mg.loc[mg["delta_score"].idxmax()]
-        summary["best_window_start"] = int(best["start"])
-        summary["best_window_end"] = int(best["end"])
-    return mg, summary
+    """Geometry->delta correlations, including the squared-curvature term Q^2."""
+    rp_with_q2 = rp.copy()
+    rp_with_q2["Q2"] = rp_with_q2["Q"] ** 2
+    return eval_core_functional_corr(delta_long, rp_with_q2)
 
 
 def variants_for(top_k_dims: int) -> list[str]:
@@ -184,13 +156,13 @@ def main() -> None:
 
     device = resolve_device()
     load_in_4bit = args.dtype == "int4"
-    torch_dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "int4": None}[args.dtype]
+    torch_dtype = torch.float32 if args.dtype == "float32" else (torch.bfloat16 if args.dtype == "bfloat16" else None)
     tag = args.model.split("/")[-1]
     out = Path(args.output_dir) / tag
     out.mkdir(parents=True, exist_ok=True)
 
     model, tok = load_pythia(args.model, device=device, dtype=torch_dtype, load_in_4bit=load_in_4bit)
-    cka_device = device if device.type == "cuda" else "cpu"
+    cka_device = cka_device_for(device)
 
     questions = make_guesstimation_questions(seed=args.seed)[: args.capture_n]
     prompts = pd.DataFrame(
